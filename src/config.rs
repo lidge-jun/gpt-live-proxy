@@ -171,6 +171,45 @@ pub enum ConfigError {
     Invalid { key: &'static str, reason: String },
 }
 
+/// Reject a base URL that cannot be extended by path concatenation.
+///
+/// The call-create builders append `/realtime/calls` and a query, so a base
+/// carrying its own query or fragment would produce `.../base#frag/realtime/calls?...`
+/// — a malformed URL that fails far from its cause.
+fn validate_base_url(raw: &str) -> Result<String, ConfigError> {
+    let invalid = |reason: &str| ConfigError::Invalid {
+        key: "GPT_LIVE_BASE_URL",
+        reason: reason.to_string(),
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid("must not be empty"));
+    }
+
+    // Parsed, not prefix-checked: `http://` and `http:///path` pass a scheme
+    // test but have no host, and would fail confusingly at relay time.
+    let parsed = reqwest::Url::parse(trimmed).map_err(|err| invalid(&err.to_string()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(invalid("must use the http or https scheme"));
+    }
+    // A host is required. Note `http:///path` is NOT the empty-host case it
+    // looks like: the parser reads `path` as the host, which is a legitimate —
+    // if unhelpful — base. `http://` genuinely has no host and is rejected by
+    // the parser itself.
+    match parsed.host_str() {
+        None => return Err(invalid("must include a host")),
+        Some(host) if host.trim().is_empty() => {
+            return Err(invalid("must include a host"));
+        }
+        Some(_) => {}
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(invalid("must not carry a query or fragment"));
+    }
+    Ok(trimmed.to_string())
+}
+
 impl Config {
     /// Build a config from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -194,10 +233,12 @@ impl Config {
         let mode = get("GPT_LIVE_UPSTREAM_MODE").unwrap_or_else(|| "chatgpt".to_string());
         let upstream = match mode.as_str() {
             "chatgpt" => UpstreamProfile::ChatGptBackend {
-                base_url: get("GPT_LIVE_BASE_URL")
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| CHATGPT_BACKEND_BASE.to_string()),
+                // An explicitly set but empty value is a configuration mistake,
+                // not a request for the default.
+                base_url: match get("GPT_LIVE_BASE_URL") {
+                    Some(raw) => validate_base_url(&raw)?,
+                    None => CHATGPT_BACKEND_BASE.to_string(),
+                },
                 auth,
                 account_id: get("GPT_LIVE_ACCOUNT_ID")
                     .map(|v| v.trim().to_string())
@@ -205,10 +246,10 @@ impl Config {
                     .map(AccountId::new),
             },
             "apikey" => UpstreamProfile::ApiKey {
-                base_url: get("GPT_LIVE_BASE_URL")
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| OPENAI_API_BASE.to_string()),
+                base_url: match get("GPT_LIVE_BASE_URL") {
+                    Some(raw) => validate_base_url(&raw)?,
+                    None => OPENAI_API_BASE.to_string(),
+                },
                 auth,
             },
             other => {
@@ -446,6 +487,36 @@ mod tests {
             format!("{:?}", cfg.upstream.account_id().unwrap()),
             "<account-id redacted>"
         );
+    }
+
+    #[test]
+    fn a_base_url_with_a_query_or_fragment_is_rejected() {
+        // Path concatenation would otherwise produce .../base#frag/realtime/calls?...
+        for bad in [
+            "https://h.test/base?x=1",
+            "https://h.test/base#frag",
+            "ftp://h.test/base",
+            "h.test/base",
+            "http://",
+            "",
+            "   ",
+        ] {
+            let err = Config::from_source(source(&[
+                ("GPT_LIVE_TOKEN", "t"),
+                ("GPT_LIVE_BASE_URL", bad),
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        key: "GPT_LIVE_BASE_URL",
+                        ..
+                    }
+                ),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     #[test]

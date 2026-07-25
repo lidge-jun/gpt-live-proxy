@@ -8,6 +8,7 @@ pub mod admission;
 pub mod app;
 pub mod config;
 pub mod error;
+pub mod live;
 pub mod wire;
 
 pub use admission::DrainState;
