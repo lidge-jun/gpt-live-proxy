@@ -207,6 +207,11 @@ fn validate_base_url(raw: &str) -> Result<String, ConfigError> {
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(invalid("must not carry a query or fragment"));
     }
+    // Userinfo would end up in a log line that only intends to record a host,
+    // and a credential in a URL is a bad idea regardless.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid("must not embed credentials"));
+    }
     Ok(trimmed.to_string())
 }
 
@@ -500,6 +505,8 @@ mod tests {
             "http://",
             "",
             "   ",
+            "https://user:secret@h.test/v1",
+            "https://user@h.test/v1",
         ] {
             let err = Config::from_source(source(&[
                 ("GPT_LIVE_TOKEN", "t"),

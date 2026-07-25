@@ -186,33 +186,78 @@ pub async fn handle_sideband(
         Err(err) => return err.into_response(),
     };
 
+    let join_style = match &target {
+        SidebandTarget::FramelessPath { .. } => "frameless_path",
+        SidebandTarget::RealtimeCallsPath { .. } => "realtime_calls_path",
+        SidebandTarget::RealtimeQuery { .. } => "realtime_query",
+    };
+
     let upstream_url = sideband_upstream_url(
         config.upstream.base_url(),
         config.upstream.uses_backend_shape(),
         &target,
     );
 
-    upgrade.on_upgrade(move |socket| async move {
-        let connect = async move {
-            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    // Service-owned: one writer for the whole process, cloned per upgrade.
+    let frame_logger = state.frame_log.clone();
 
-            // Built from IntoClientRequest and THEN extended: hand-rolling a
-            // bare request would omit Sec-WebSocket-Key and friends.
-            let mut request = match upstream_url.as_str().into_client_request() {
-                Ok(request) => request,
-                Err(err) => return Err(err.to_string()),
+    // Host only, parsed rather than split: the URL embeds the call id, and a
+    // split would also expose any userinfo.
+    let upstream_host = crate::live::call_create::upstream_host_of(&upstream_url);
+
+    // A real span, so every event inside the relay carries this context.
+    // `outcome` and `code` are recorded when the relay ends, so the span itself
+    // carries the terminal state rather than only its events.
+    let span = tracing::info_span!(
+        "sideband",
+        join_style = join_style,
+        upstream = %upstream_host,
+        outcome = tracing::field::Empty,
+        code = tracing::field::Empty
+    );
+
+    upgrade.on_upgrade(move |socket| {
+        // `Instrument`, not `span.enter()`: holding an entered guard across an
+        // await can attribute another task's events to this span when the task
+        // suspends.
+        use tracing::Instrument;
+        async move {
+            let connect = async move {
+                use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+                // Built from IntoClientRequest and THEN extended: hand-rolling a
+                // bare request would omit Sec-WebSocket-Key and friends.
+                let mut request = match upstream_url.as_str().into_client_request() {
+                    Ok(request) => request,
+                    Err(err) => return Err(err.to_string()),
+                };
+                for (name, value) in upstream_headers.iter() {
+                    request.headers_mut().insert(name.clone(), value.clone());
+                }
+                match tokio_tungstenite::connect_async(request).await {
+                    Ok((stream, _response)) => Ok(stream),
+                    Err(err) => Err(err.to_string()),
+                }
             };
-            for (name, value) in upstream_headers.iter() {
-                request.headers_mut().insert(name.clone(), value.clone());
-            }
-            match tokio_tungstenite::connect_async(request).await {
-                Ok((stream, _response)) => Ok(stream),
-                Err(err) => Err(err.to_string()),
-            }
-        };
 
-        let outcome = run_pump(socket, connect).await;
-        tracing::debug!(?outcome, "sideband relay finished");
+            // Logged before the pump runs, but described accurately: the upstream
+            // handshake has not completed yet at this point.
+            tracing::debug!("sideband downstream upgraded");
+            let outcome = run_pump(socket, connect, frame_logger).await;
+            // Kind and code only: `?outcome` would render the peer-controlled close
+            // reason, which can carry transcript text or a credential.
+            let span = tracing::Span::current();
+            span.record("outcome", outcome.label());
+            if let Some(code) = outcome.code() {
+                span.record("code", code);
+            }
+            tracing::info!(
+                outcome = outcome.label(),
+                code = outcome.code(),
+                "sideband relay finished"
+            );
+        }
+        .instrument(span)
     })
 }
 

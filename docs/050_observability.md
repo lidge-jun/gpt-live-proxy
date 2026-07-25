@@ -11,7 +11,9 @@ src/observability/frame_log.rs
 
 ## Tracing
 
-`tracing_subscriber` with an env filter (`GPT_LIVE_LOG`, default `info`). Spans: `call_create` (method, path, upstream host, status, elapsed) and `sideband` (join style, upstream host, close code). **Never** logged: authorization values, account ids, bearer tokens, SDP bodies, session JSON, frame payloads.
+`tracing_subscriber` with an env filter (`GPT_LIVE_LOG`, default `info`). Spans: `call_create` (method, path, upstream host, status, elapsed) and `sideband` (join style, upstream host, close code). **Never** logged by the tracing layer: authorization values, account ids, bearer tokens, SDP bodies, session JSON, frame payloads, close reasons, or full upstream URLs (the host only, since a URL embeds the call id).
+
+The opt-in frame log is the one exception and is governed by its own guarantee below: it writes nothing for a clean frame and a bounded excerpt for a corrupted one.
 
 Credential protection is layered, because a newtype alone is insufficient (`002` D5):
 
@@ -48,13 +50,27 @@ Rules carried over verbatim from `001` §8:
 - One JSONL record appended per relayed frame, immediately before the send attempt, so a record proves receipt and attempted forwarding rather than delivery.
 - `bytes` is the UTF-8 byte length for text and the raw length for binary.
 - Binary payloads are decoded **only** to detect U+FFFD; the decoded form never feeds back into the relayed frame.
-- `context` is present only when U+FFFD is found, spanning at most 24 characters on each side of the first occurrence, clamped to char boundaries.
+- `context` is present only when U+FFFD is found, spanning at most 24 scalars on each side of the first occurrence, clamped to char boundaries. A frame shorter than that window yields the whole frame; see the guarantee section below.
 - Any IO error while logging is swallowed — forensics must never break a call.
 
-`context` is computed over Unicode scalar values with char-boundary clamping. The TypeScript original slices UTF-16 code units with an exclusive end (up to 24 before, at most 23 after); the invariant preserved here is *bounded excerpt, never the full payload*, not the exact unit count. `001` §8 records the divergence.
+`context` is computed over Unicode scalar values with char-boundary clamping. The TypeScript original slices UTF-16 code units with an exclusive end (up to 24 before, at most 23 after); the invariant preserved here is a *bounded* excerpt, not the exact unit count. `001` §8 records the divergence, and the guarantee section below states precisely what "bounded" does and does not promise.
 
-Excerpts can contain adjacent transcript text, so the README documents the log as sensitive diagnostic output. The operator chooses the path, so `.gitignore` alone cannot guarantee exclusion — the README states that the log must be written outside the working tree.
+## The privacy guarantee, stated precisely
+
+The claim is **bounded excerpt**, not **no payload**. Specifically:
+
+- A clean frame produces no excerpt at all. This is the common case and the one that matters for a normal call.
+- A corrupted frame produces up to `CONTEXT_CHARS` scalars on each side of the first replacement character. A frame shorter than that window yields the whole frame.
+- Therefore a secret adjacent to the corruption **is** in the excerpt.
+
+That last point is a deliberate trade rather than an oversight: an excerpt that omitted the surrounding bytes could not attribute corruption, which is the only reason the log exists. The mitigations are that the log is opt-in, that clean frames write nothing, and that the operator is told to treat the file as sensitive.
+
+Because the operator chooses the path, `.gitignore` cannot guarantee exclusion — the README instructs writing the log outside the working tree.
+
+## Non-blocking by construction
+
+Records are handed to a dedicated writer thread through a bounded channel and dropped when it is full. A synchronous `open`/`write` inside the relay would block on a slow disk, a stalled network filesystem, or a FIFO, and blocking there stops frame forwarding. Losing a diagnostic record under pressure is strictly better than stalling a voice call.
 
 ## Exit criteria
 
-Tests: inert when unset; a clean text frame produces `fffd: false` and no `context`; a frame containing U+FFFD produces a bounded excerpt and never the full payload; a multi-byte payload clamps to char boundaries; a binary frame reports raw byte length; an unwritable path does not panic or abort the relay; an append failure mid-relay leaves the relay running; `BearerToken` redaction, header sensitivity, and `redacted_headers`.
+Tests: inert when unset; a clean text frame produces `fffd: false` and no `context`; a frame containing U+FFFD produces a bounded excerpt, and text beyond the window is absent while adjacent text is captured by design; a multi-byte payload clamps to char boundaries; a binary frame reports raw byte length; an unwritable path does not panic or abort the relay; an append failure mid-relay leaves the relay running; `BearerToken` redaction, header sensitivity, and `redacted_headers`.

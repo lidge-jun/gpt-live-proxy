@@ -13,6 +13,28 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
 use crate::live::ws_convert::{axum_to_tungstenite, close_parts, tungstenite_to_axum};
+use crate::observability::{Direction, FrameLogger};
+
+/// Record a frame immediately before it is forwarded.
+///
+/// Before, not after: a record therefore proves the relay received the frame
+/// and attempted to forward it, which is what attribution needs. It does not
+/// claim the peer received it.
+fn log_frame(logger: &FrameLogger, dir: Direction, message: &TungMessage) {
+    match message {
+        TungMessage::Text(text) => logger.log_text(dir, text.as_str()),
+        TungMessage::Binary(bytes) => logger.log_binary(dir, bytes),
+        _ => {}
+    }
+}
+
+fn log_axum_frame(logger: &FrameLogger, dir: Direction, message: &AxumMessage) {
+    match message {
+        AxumMessage::Text(text) => logger.log_text(dir, text.as_str()),
+        AxumMessage::Binary(bytes) => logger.log_binary(dir, bytes),
+        _ => {}
+    }
+}
 
 /// Frames buffered while the upstream handshake is still in flight.
 ///
@@ -41,6 +63,28 @@ pub const CODE_INTERNAL: u16 = 1011;
 pub const CODE_NORMAL: u16 = 1000;
 
 /// What ended the relay, so the caller can log it without re-deriving it.
+impl PumpOutcome {
+    /// A log-safe label. The upstream's close reason is peer-controlled and can
+    /// carry transcript text or a token, so it never reaches a log line: only
+    /// the kind and the numeric code do.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ClientClosed => "client_closed",
+            Self::UpstreamClosed { .. } => "upstream_closed",
+            Self::Aborted { .. } => "aborted",
+        }
+    }
+
+    /// The close code, which is a small integer and safe to log.
+    pub fn code(&self) -> Option<u16> {
+        match self {
+            Self::ClientClosed => Some(CODE_NORMAL),
+            Self::UpstreamClosed { code, .. } => Some(*code),
+            Self::Aborted { code, .. } => Some(*code),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PumpOutcome {
     /// The downstream peer closed; the upstream was closed with 1000.
@@ -65,7 +109,11 @@ pub fn accept_pending(queue_len: usize) -> bool {
 /// `connect` is the in-flight upstream handshake. It is polled alongside the
 /// downstream stream so frames arriving during the handshake are queued rather
 /// than lost, and so the 33rd such frame can be refused.
-pub async fn run_pump<C, S>(mut downstream: WebSocket, connect: C) -> PumpOutcome
+pub async fn run_pump<C, S>(
+    mut downstream: WebSocket,
+    connect: C,
+    logger: FrameLogger,
+) -> PumpOutcome
 where
     C: std::future::Future<Output = Result<S, String>>,
     S: futures_util::Sink<TungMessage, Error = tokio_tungstenite::tungstenite::Error>
@@ -117,6 +165,7 @@ where
     // Flush in arrival order: the queue exists to preserve ordering, not merely
     // to avoid dropping frames.
     while let Some(message) = queue.pop_front() {
+        log_frame(&logger, Direction::ClientToUpstream, &message);
         if upstream.send(message).await.is_err() {
             close_downstream(downstream, CODE_INTERNAL, CLOSE_UPSTREAM_SEND_FAILED).await;
             return PumpOutcome::Aborted {
@@ -141,6 +190,7 @@ where
                     let Some(converted) = axum_to_tungstenite(message) else {
                         continue;
                     };
+                    log_frame(&logger, Direction::ClientToUpstream, &converted);
                     if upstream.send(converted).await.is_err() {
                         close_downstream(downstream, CODE_INTERNAL, CLOSE_UPSTREAM_SEND_FAILED).await;
                         return PumpOutcome::Aborted {
@@ -163,6 +213,7 @@ where
                     let Some(converted) = tungstenite_to_axum(message) else {
                         continue;
                     };
+                    log_axum_frame(&logger, Direction::UpstreamToClient, &converted);
                     if downstream.send(converted).await.is_err() {
                         // Close the upstream explicitly rather than dropping it:
                         // the outcome claims both sides were closed, so both

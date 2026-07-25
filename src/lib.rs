@@ -9,9 +9,11 @@ pub mod app;
 pub mod config;
 pub mod error;
 pub mod live;
+pub mod observability;
 pub mod wire;
 
 pub use admission::DrainState;
 pub use config::{AccountId, BearerToken, Config, UpstreamProfile};
 pub use error::{RelayError, RequestKind};
+pub use observability::{redacted_headers, Direction, FrameLogger};
 pub use wire::{SidebandJoinStyle, WireAdapter};

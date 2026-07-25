@@ -99,13 +99,33 @@ pub struct UpstreamResult {
 ///
 /// Both paths are handled identically; `/v1/realtime/calls` is the public
 /// Realtime alias.
+#[tracing::instrument(
+    name = "call_create",
+    skip_all,
+    fields(
+        method = %method,
+        path = %path,
+        upstream = tracing::field::Empty,
+        status = tracing::field::Empty,
+        elapsed_ms = tracing::field::Empty
+    )
+)]
 pub async fn handle_call_create(
     State(state): State<AppState>,
     method: Method,
+    path: RequestPath,
     request_headers: HeaderMap,
     request_body: Body,
 ) -> Response {
+    let started = std::time::Instant::now();
     let config = state.config.clone();
+
+    // Recorded at entry, not after the body read: the configured host is
+    // already known, so an early failure must not leave the span incomplete.
+    tracing::Span::current().record(
+        "upstream",
+        upstream_host_of(config.upstream.base_url()).as_str(),
+    );
     let inbound_content_type = request_headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -124,7 +144,7 @@ pub async fn handle_call_create(
         Ok(bytes) => bytes,
         Err(err) => {
             slot.finish(Outcome::Failed(err.message()));
-            return err.into_response();
+            return failed(err, started);
         }
     };
 
@@ -143,7 +163,7 @@ pub async fn handle_call_create(
                 Ok((rewritten, content_type)) => (rewritten, content_type.to_string()),
                 Err(err) => {
                     slot.finish(Outcome::Failed(err.message()));
-                    return err.into_response();
+                    return failed(err, started);
                 }
             }
         } else {
@@ -162,7 +182,7 @@ pub async fn handle_call_create(
             Ok(headers) => headers,
             Err(err) => {
                 slot.finish(Outcome::Failed(err.message()));
-                return err.into_response();
+                return failed(err, started);
             }
         };
     if let Ok(value) = HeaderValue::from_str(&outbound_content_type) {
@@ -170,6 +190,7 @@ pub async fn handle_call_create(
         upstream_headers.insert(http::header::CONTENT_TYPE, value);
     }
 
+    let upstream_host_for_log = upstream_host_of(&target);
     let task = spawn_upstream(
         state.http.clone(),
         config.clone(),
@@ -180,11 +201,30 @@ pub async fn handle_call_create(
         token,
     );
 
+    // Already recorded at entry from the configured base. Re-record only if the
+    // resolved target actually differs, so the span carries one value rather
+    // than the same host twice.
+    if upstream_host_for_log != upstream_host_of(config.upstream.base_url()) {
+        tracing::Span::current().record("upstream", upstream_host_for_log.as_str());
+    }
+
     match task.await {
-        Ok(Ok(result)) => relay_response(result),
-        Ok(Err(err)) => err.into_response(),
-        // The task was cancelled or panicked; the guard already recorded why.
-        Err(_) => RelayError::ClientCanceled.into_response(),
+        Ok(Ok(result)) => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let span = tracing::Span::current();
+            span.record("status", result.status.as_u16());
+            span.record("elapsed_ms", elapsed_ms);
+            tracing::info!(
+                status = result.status.as_u16(),
+                elapsed_ms,
+                "call-create completed"
+            );
+            relay_response(result)
+        }
+        Ok(Err(err)) => failed(err, started),
+        // The task was cancelled or panicked; the guard already recorded why,
+        // but the response still gets its log line like every other path.
+        Err(_) => failed(RelayError::ClientCanceled, started),
     }
 }
 
@@ -279,6 +319,64 @@ fn spawn_upstream(
     })
 }
 
+/// The inbound path, extracted so the span records the route that was actually
+/// requested rather than a hardcoded one.
+pub struct RequestPath(String);
+
+impl From<String> for RequestPath {
+    fn from(path: String) -> Self {
+        Self(path)
+    }
+}
+
+impl std::fmt::Display for RequestPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestPath {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.uri.path().to_string()))
+    }
+}
+
+/// Emit the failure event and the response together, so no early return can
+/// produce a response without a corresponding log line.
+fn failed(err: RelayError, started: std::time::Instant) -> Response {
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let span = tracing::Span::current();
+    span.record("status", err.status().as_u16());
+    span.record("elapsed_ms", elapsed_ms);
+    tracing::warn!(
+        status = err.status().as_u16(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        // The error CODE, not its message: a message can embed upstream text.
+        error = err.error_code(),
+        "call-create failed"
+    );
+    err.into_response()
+}
+
+/// Host and port only. The full URL can carry a call id or other identifiers,
+/// so it never reaches a log line.
+pub fn upstream_host_of(url: &str) -> String {
+    // Parsed, not split: a split would happily log `user:secret@host`.
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => match (parsed.host_str(), parsed.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            (None, _) => "unknown".to_string(),
+        },
+        Err(_) => "unknown".to_string(),
+    }
+}
+
 fn relay_response(result: UpstreamResult) -> Response {
     let mut response = Response::new(Body::from(result.body));
     *response.status_mut() = result.status;
@@ -293,6 +391,29 @@ mod tests {
     #[test]
     fn only_the_two_relay_headers_are_listed() {
         assert_eq!(RELAY_HEADERS, ["content-type", "location"]);
+    }
+
+    #[test]
+    fn a_url_with_userinfo_never_reaches_a_log_line() {
+        // Splitting on "://" and "/" would return `user:secret@host`.
+        assert_eq!(
+            upstream_host_of("https://user:secret@api.openai.com/v1/realtime/calls"),
+            "api.openai.com"
+        );
+        assert_eq!(
+            upstream_host_of("http://127.0.0.1:8080/v1/live"),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(upstream_host_of("not a url"), "unknown");
+    }
+
+    #[test]
+    fn the_host_excludes_the_path_and_query() {
+        // The path carries the call id and the query can carry identifiers.
+        assert_eq!(
+            upstream_host_of("https://api.openai.com/v1/realtime?call_id=rtc_secret"),
+            "api.openai.com"
+        );
     }
 
     #[test]

@@ -175,9 +175,9 @@ Disabled entirely when the env var is unset. When set to a path, every relayed f
 { "ts": "<ISO-8601>", "dir": "c2u|u2c", "kind": "text|binary", "bytes": 123, "fffd": false, "context": "<optional>" }
 ```
 
-`context` appears only when the decoded representation contains U+FFFD (`src/server/live.ts:82-90`, `:114-122`). The TypeScript window is computed in **UTF-16 code units** with an exclusive end: `slice(max(0, idx - 24), min(len, idx + 24))`, so it yields up to 24 units before the replacement character and at most 23 after it — not "24 characters on each side". The Rust port works in Unicode scalar values with char-boundary clamping, which is a documented, tested divergence; the invariant that survives is *bounded excerpt, never the full payload*.
+`context` appears only when the decoded representation contains U+FFFD (`src/server/live.ts:82-90`, `:114-122`). The TypeScript window is computed in **UTF-16 code units** with an exclusive end: `slice(max(0, idx - 24), min(len, idx + 24))`, so it yields up to 24 units before the replacement character and at most 23 after it — not "24 characters on each side". The Rust port works in Unicode scalar values with char-boundary clamping, which is a documented, tested divergence; the invariant that survives is a *bounded* excerpt. Note that "bounded" is not "empty": a frame shorter than the window is captured whole, in the source as well as in the port.
 
-Full payloads are never written, credentials and URLs never appear, and a logging exception can never break the relay. The excerpt may still contain adjacent transcript text and is therefore sensitive diagnostic data (`src/server/live.ts:73-80`).
+A clean frame writes no payload, headers and URLs never appear, and a logging exception can never break the relay. The excerpt around a replacement character does contain adjacent transcript text and is therefore sensitive diagnostic data (`src/server/live.ts:73-80`).
 
 ## 9. Test-derived contract inventory
 

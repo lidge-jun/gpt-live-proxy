@@ -71,6 +71,8 @@ Three independent mechanisms, because a newtype alone is not enough:
 
 Config accepts secrets from the environment only; no file in the repository contains a real token shape.
 
+**Scope of this guarantee.** It covers *credentials the relay handles*: bearer tokens, account identifiers, and the admission secret. It does not extend to arbitrary text a client chooses to put inside a WebSocket frame. If a caller writes a token into frame content and that content is corrupted, the opt-in frame log can capture it in the bounded excerpt around the corruption — see `050` for the precise statement. The three layers above make it impossible for the relay to leak a credential it manages; they cannot make it impossible for a client to leak its own.
+
 ## D6. Environment variable naming
 
 OpenCodex uses `OCX_LIVE_FRAME_LOG`. The standalone service uses `GPT_LIVE_FRAME_LOG`, with `OCX_LIVE_FRAME_LOG` accepted as a compatibility alias so an existing diagnostic workflow keeps working.

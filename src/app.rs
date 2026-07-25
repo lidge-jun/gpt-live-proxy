@@ -18,6 +18,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
     pub drain: DrainState,
+    /// Service-owned so shutdown can flush it and so tests can inject one.
+    pub frame_log: crate::observability::FrameLogger,
 }
 
 impl AppState {
@@ -29,6 +31,7 @@ impl AppState {
             // The relay owns its own timeouts per request, so the client carries none.
             http: reqwest::Client::builder().build()?,
             drain: DrainState::new(),
+            frame_log: crate::observability::FrameLogger::from_env_owned(),
         })
     }
 }
@@ -136,6 +139,7 @@ async fn call_create_dispatch(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
+    let uri_path = uri.path().to_string();
     if method != Method::POST {
         return RelayError::UnknownEndpoint {
             method: method.to_string(),
@@ -143,7 +147,8 @@ async fn call_create_dispatch(
         }
         .into_response();
     }
-    crate::live::handle_call_create(state, method, headers, body).await
+    let path = crate::live::call_create::RequestPath::from(uri_path);
+    crate::live::handle_call_create(state, method, path, headers, body).await
 }
 
 #[cfg(test)]

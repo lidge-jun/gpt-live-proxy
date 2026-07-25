@@ -4,15 +4,10 @@ use std::process::ExitCode;
 
 use gpt_live_proxy::app::{router, AppState};
 use gpt_live_proxy::config::Config;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("GPT_LIVE_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    gpt_live_proxy::observability::init_tracing();
 
     let config = match Config::from_env() {
         Ok(config) => config,
@@ -48,13 +43,22 @@ async fn main() -> ExitCode {
     // during the graceful-shutdown window get 503 rather than a dropped socket.
     let drain = state.drain.clone();
 
-    if let Err(err) = axum::serve(listener, router(state))
+    let mut frame_log = state.frame_log.clone();
+
+    let serve_result = axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             drain.begin();
         })
-        .await
-    {
+        .await;
+
+    // Flush forensics on BOTH paths: an error exit is exactly when the tail of
+    // the log is most worth having.
+    if !frame_log.drain() {
+        tracing::warn!("frame log did not flush within the shutdown budget");
+    }
+
+    if let Err(err) = serve_result {
         tracing::error!("server error: {err}");
         return ExitCode::FAILURE;
     }
