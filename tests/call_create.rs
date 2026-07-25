@@ -272,6 +272,12 @@ async fn only_content_type_and_location_come_back() {
         response.headers().get("location").unwrap(),
         "/v1/realtime/calls/rtc_test_call"
     );
+    // Positively asserted, not merely "other headers are absent": the client
+    // needs this to parse the answer SDP.
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/sdp"
+    );
     for dropped in ["set-cookie", "x-request-id", "cache-control"] {
         assert!(
             response.headers().get(dropped).is_none(),

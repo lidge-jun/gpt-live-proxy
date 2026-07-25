@@ -19,7 +19,8 @@ test: add integration tests, CI workflow, and README
 
 The order follows the build sequence `010 → 015 → 040 → 020 → 030 → 050 → 060`, not the document numbers.
 
-Committing per phase is what survives a context compaction; the final commit is the last of the chain, not the only one.
+One commit per phase, so the history reads as a sequence of reviewed units
+rather than a single drop.
 
 ## Publication
 
@@ -27,7 +28,8 @@ Committing per phase is what survives a context compaction; the final commit is 
 gh repo create lidge-jun/gpt-live-proxy --public --source . --remote origin --push
 ```
 
-The user pre-approved the push ("푸시도하고"), scoped to this new repository only. Nothing in the OpenCodex repository is committed, branched, or pushed by this work.
+Scoped to this repository only. Nothing in the OpenCodex repository is
+committed, branched, or pushed by this work.
 
 ## Verification
 
@@ -51,4 +53,5 @@ Additional checks:
 
 - No `.env` committed; `.gitignore` covers `/target`, `.env*`, and `*.jsonl`.
 - Frame logs are operator-chosen paths, so `.gitignore` cannot guarantee exclusion — the README instructs writing them outside the working tree.
-- Every CI action is pinned to an immutable **commit** SHA — verified with `gh api repos/<owner>/<repo>/commits/<sha>`, which fails for an annotated tag object. The workflow consumes no secrets and requests no elevated permissions.
+- Every CI action is pinned to an immutable **commit** SHA — verified with `gh api repos/<owner>/<repo>/commits/<sha>`, which fails for an annotated tag object.
+- No repository or user secrets reach the workflow. The automatic `GITHUB_TOKEN` that `actions/checkout` uses is scoped `contents: read` and is not persisted into `.git/config`.

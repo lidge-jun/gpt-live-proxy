@@ -2,7 +2,10 @@
 name = "gpt-live-proxy"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# The floor is set by `idna`/`icu_*` reached through `reqwest -> url`, verified
+# with `cargo metadata`. CI pins this exact toolchain in a dedicated job, since
+# a floating `stable` can never detect MSRV drift.
+rust-version = "1.86"
 description = "A faithful standalone relay for the GPT-Live / OpenAI Realtime voice protocol"
 license = "MIT"
 repository = "https://github.com/lidge-jun/gpt-live-proxy"

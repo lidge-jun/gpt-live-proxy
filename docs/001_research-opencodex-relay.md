@@ -1,8 +1,9 @@
 # 001 — OpenCodex relay behavior (research)
 
-Research-only document. Source is read-only: the OpenCodex repository at
-`/Users/jun/Developer/new/700_projects/opencodex`, tree state `5a550867`.
-Citations use `path:line` relative to that repository.
+Research notes on the relay in [`lidge-jun/opencodex`](https://github.com/lidge-jun/opencodex)
+at tree state `5a550867`. Citations use `path:line` relative to that repository,
+so each one resolves at
+`https://github.com/lidge-jun/opencodex/blob/5a550867/<path>#L<line>`.
 
 Verification run by the explorer against that tree:
 

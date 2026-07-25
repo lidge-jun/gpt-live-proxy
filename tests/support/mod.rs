@@ -60,6 +60,7 @@ impl Default for UpstreamBehavior {
             body_bytes: None,
             location: Some("/v1/realtime/calls/rtc_test_call"),
             extra_headers: vec![
+                ("content-type", "application/sdp"),
                 ("set-cookie", "session=leaked"),
                 ("x-request-id", "req-123"),
                 ("cache-control", "no-store"),

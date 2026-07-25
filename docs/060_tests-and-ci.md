@@ -1,66 +1,92 @@
 # 060 — Integration tests, CI, README
 
-Work-phase `wp7-tests-ci`. Deliverable: an executable proof of every contract claim.
+Work-phase `wp7-tests-ci`. Deliverable: executable proof for the contract
+claims, plus an honest ledger of what is *not* proven — see "Known gaps".
 
 ## Test layout
 
+What actually exists, rather than what was planned. Most contract coverage lives
+in unit tests next to the code it pins; the integration suites cover what only a
+real socket can prove.
+
 ```text
-tests/support/mod.rs          mock upstream HTTP + WS servers, request capture
-tests/trust_boundary.rs       admission, origin, CORS, draining
-tests/call_create.rs          the POST contract
-tests/sideband.rs             the WebSocket contract
-tests/wire_adapters.rs        session serialization and truth tables
-tests/forensics.rs            frame-log privacy
+tests/support/mod.rs     mock upstream HTTP server with request capture
+tests/call_create.rs     the POST contract over real sockets      (15 tests)
+tests/sideband.rs        the WebSocket contract over real sockets (15 tests)
+tests/forensics.rs       frame-log privacy and the tracing contract (11 tests)
+src/**/tests             unit coverage for every module           (214 tests)
 ```
 
-The mock upstream is a real `axum` server bound to port 0, recording each received request (method, full URI including query, header map, body bytes) into a shared `Arc<Mutex<Vec<CapturedRequest>>>`. Asserting against a captured URI string is what makes the URL rules testable rather than merely documented.
+`tests/trust_boundary.rs` and `tests/wire_adapters.rs` were planned as separate
+files and were not created: the trust boundary is covered by unit tests in
+`src/admission/` plus router-level tests in `src/app.rs`, and the adapter truth
+tables are unit tests in `src/wire/`. Both are genuinely covered; the file
+layout simply differs from the plan.
 
-## Cases
+## What each integration suite proves
 
 `call_create.rs`
 
-- ChatGPT backend: multipart in → `{"sdp":…,"session":…}` out, URI ends with `/realtime/calls?intent=quicksilver&architecture=avas`, content type `application/json`.
-- SDP-only multipart → `{"sdp":…}` with no `session` key.
-- API key: multipart preserved byte for byte, URI `/v1/realtime/calls?intent=quicksilver&architecture=avas`.
-- All six protocol headers forwarded; empty values dropped; `x-openai-fedramp` absent; client `authorization` replaced by proxy auth.
-- `/v1/realtime/calls` behaves identically to `/v1/live`.
-- Response relay: only `content-type` and `location` survive; status and body preserved.
-- Caps: exactly 16 MiB accepted, 16 MiB + 1 rejected `413`; oversized upstream response `502`.
-- Upstream timeout `504`; connect failure `502`.
-- Each of the four multipart errors returns its exact message.
-- `GET /v1/live` without an upgrade → `404`.
-- Client cancellation mid-body and mid-response: asserted by reading the recorded `Outcome::ClientCanceled` from the spawned upstream task's slot, **not** by reading a response — a departed client cannot receive one. `020` §Cancellation defines the ownership model that makes this observable.
-- The full error inventory of `001` §10 walked as a table-driven test: every implemented row asserts status, message, `type`, and `code`.
+- The ChatGPT rewrite: multipart in, `{sdp, session}` out, AVAS URL, session id
+  stripped, and no top-level `type` added.
+- The API-key path forwards multipart byte for byte with its boundary intact.
+- All six protocol headers forwarded; `authorization`, `chatgpt-account-id`,
+  `x-openai-fedramp`, and `cookie` replaced or dropped.
+- An absent `openai-alpha` is never invented.
+- Both relayed response headers are asserted positively — an upstream
+  `content-type: application/sdp` and the `location` — while cookies, request
+  ids, and cache headers are dropped.
+- Cap boundaries, upstream timeout, unreachable upstream, an exact multipart
+  error message, a non-POST 404, and an invalid configured credential failing
+  before any upstream contact.
+- A downstream disconnect actually cancelling the upstream call, proven by an
+  upstream that signals when its response body is dropped.
 
 `sideband.rs`
 
-- All three join styles produce the exact upstream URL, for both backend and API-key profiles.
-- The `3b766d91` rule: a ChatGPT backend profile still joins `api.openai.com`.
-- Protocol headers present on the upstream handshake.
-- Text echo, binary echo, and a >1 MiB Korean UTF-8 payload all byte-identical.
-- Binary stays binary (asserted on the message variant, not on decoded bytes).
-- Upstream close code and reason propagate downstream; a client close arrives upstream as `1000` `client closed`.
-- The 33rd pre-open frame closes `1009`.
-- Call-id boundaries: 1, 128, 129 chars, empty, slash, encoded slash, unicode.
-- Malformed percent escape → `404`, not a panic.
-- Connect failure → `1011 upstream connect failed`; missing upstream → `1011 missing upstream`; upstream transport error → `1011 upstream error`; both send-failure paths.
-- Upstream close with no code / no reason → downstream sees `1000` / `""`.
-- Ping not forwarded, and a following data frame still arrives.
+- The Frameless-path and Realtime-query join styles reaching their documented
+  upstream paths over real sockets, including the `3b766d91` rule. The
+  `realtime/calls` path style and the full six-row style-by-profile matrix are
+  unit-tested rather than socket-tested.
+- Text, binary, and a >1 MiB UTF-8 payload surviving unchanged, with binary
+  asserted at the variant level rather than by decoded bytes.
+- Both close directions against a recording upstream: an upstream close
+  propagates its code and reason; a client close arrives as `1000`/`client closed`.
+- The pre-open queue, using a handshake held open by an explicit barrier: eight
+  frames flushed in order, a 33rd frame closing `1009`, and 50 pings not
+  consuming the budget.
+- A trailing slash reaching the parser, a non-upgrade GET returning the contract
+  404, and an unreachable upstream closing `1011`.
 
-`trust_boundary.rs`
+`forensics.rs`
 
-- Loopback bind skips admission; non-loopback rejects a missing credential `401`.
-- All three admission header names accepted; an admission bearer never forwarded upstream.
-- Origin acceptance and rejection in both auth modes, with the two distinct `403` messages.
-- `OPTIONS` → `204` allowed / `403` rejected, never authenticated.
-- All six protocol header names present in `Access-Control-Allow-Headers`.
-- Draining → `503`, plain text, `Retry-After: 5`.
+- A clean transcript writing no payload at all.
+- A corrupted frame writing a bounded excerpt, and the documented trade that
+  adjacent text *is* captured.
+- An append failure being non-fatal, both directly and mid-relay.
+- A live relay logging both directions and excluding keepalives, mutation-checked.
+- The span contract for call-create and sideband, asserted against the isolated
+  span-CLOSE line so an event carrying the same value cannot satisfy it.
 
-`wire_adapters.rs` additionally asserts single authority: the AVAS decision in `020` and the join style in `030` both come from `WireAdapter`, and no second copy of either rule exists.
+## Known gaps
+
+Stated rather than papered over:
+
+- The 16 MiB cap boundary is exercised at 16/17 bytes in a unit test and with a
+  512-byte cap in integration; a literal 16 MiB + 1 body is not sent.
+- Mid-*body* client cancellation is covered by unit tests of the classifier and
+  the guard; only mid-*response* cancellation is proven end to end.
+- The `missing upstream` and `upstream not open` close mappings are unreachable
+  by construction and are documented as such in `pump.rs` rather than tested.
+- Three *reachable* close mappings have no test: `upstream error` (a transport
+  failure mid-relay), `upstream send failed`, and `client send failed`. Each
+  needs a peer that accepts a connection and then misbehaves in a specific way,
+  which the current mock upstreams cannot express.
 
 ## CI
 
-`.github/workflows/ci.yml`, triggered on push and pull request:
+`.github/workflows/ci.yml`, triggered on pushes to `main` and on every pull
+request:
 
 ```yaml
 jobs:
@@ -80,7 +106,11 @@ Every action is pinned to an **immutable commit SHA** with the resolved version 
 
 SHAs were resolved from the GitHub API on 2026-07-26. One trap worth recording: `git/ref/tags/v2.9.1` for `Swatinem/rust-cache` returns `23869a5b…`, which is the **annotated tag object**, not a commit. Dereferencing it via `git/tags/23869a5b…` yields the actual commit `c1937114…`, which is what the workflow pins. A verification step for any future bump is `gh api repos/<owner>/<repo>/commits/<sha>` — it succeeds only for a real commit.
 
-The workflow consumes no secrets and requests no elevated permissions.
+No repository or user secrets are supplied to any step, and no elevated
+permissions are requested. `actions/checkout` does use the automatic
+`GITHUB_TOKEN`, which is scoped `contents: read`; `persist-credentials: false`
+keeps it out of `.git/config`, so the untrusted build scripts, proc macros, and
+tests that run afterwards on a fork PR cannot read it.
 
 ## README
 

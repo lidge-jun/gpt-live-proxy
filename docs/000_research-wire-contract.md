@@ -1,11 +1,19 @@
 # 000 — GPT-Live / OpenAI Realtime wire contract (research)
 
-Research-only document. Sources are read-only:
+Research notes. Two sources, cited as `S1` and `S2`:
 
-- `S1` = `~/developer/codex/016_realtime-voice/00_realtime-architecture.md` — upstream `codex-rs` realtime architecture.
-- `S2` = `~/developer/codex/016_realtime-voice/01_opencodex_update_20260724.md` — the 2026-07-24 OpenCodex GPT-Live repair record.
+- `S1` — an architecture record of the upstream `codex-rs` realtime stack: the
+  three wire adapters, the call-create contract, session shapes, and the
+  sideband WebSocket. Reconstructed from `openai/codex` at the tag noted in that
+  record.
+- `S2` — the 2026-07-24 OpenCodex GPT-Live repair record, covering the two
+  defects fixed by commits `75344b09` and `3b766d91`.
 
-Every claim below carries a `S1:line` / `S2:line` citation. Literals are verbatim.
+Both are private engineering notes, so the `S1:line` / `S2:line` citations below
+are provenance markers rather than links a reader can follow. What they point at
+is reproducible from public sources: `openai/codex` for the protocol and
+`lidge-jun/opencodex` for the relay behavior. Literals are quoted verbatim so
+the claims stand on their own.
 
 ## 1. Two planes
 

@@ -136,6 +136,7 @@ use crate::app::AppState;
 use crate::error::RelayError;
 use crate::live::headers::merge_upstream_headers;
 use crate::live::pump::run_pump;
+use crate::wire::{SidebandJoinStyle, WireAdapter};
 
 /// True when the request announces a WebSocket upgrade.
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -191,6 +192,20 @@ pub async fn handle_sideband(
         SidebandTarget::RealtimeCallsPath { .. } => "realtime_calls_path",
         SidebandTarget::RealtimeQuery { .. } => "realtime_query",
     };
+
+    // The inbound path is the authority here: the relay learns the join style
+    // from what the client asked for, not from a negotiated adapter. The
+    // `WireAdapter` mapping is the same rule expressed from the adapter side,
+    // and `sideband_join_agrees_with_the_adapter` pins them together so the two
+    // cannot drift.
+    debug_assert!(matches!(
+        (&target, WireAdapter::FramelessBidi.sideband_join()),
+        (
+            SidebandTarget::FramelessPath { .. },
+            SidebandJoinStyle::Path
+        ) | (SidebandTarget::RealtimeCallsPath { .. }, _)
+            | (SidebandTarget::RealtimeQuery { .. }, _)
+    ));
 
     let upstream_url = sideband_upstream_url(
         config.upstream.base_url(),
@@ -356,6 +371,51 @@ mod tests {
     }
 
     /// The `3b766d91` rule: a ChatGPT backend call still joins the API host.
+    /// The two expressions of the join rule must agree: the adapter's own
+    /// mapping and the style the parsed inbound target implies.
+    #[test]
+    fn sideband_join_agrees_with_the_adapter() {
+        let frameless = SidebandTarget::FramelessPath {
+            call_id: "rtc_1".into(),
+        };
+        assert_eq!(
+            WireAdapter::FramelessBidi.sideband_join(),
+            SidebandJoinStyle::Path
+        );
+        assert!(matches!(frameless, SidebandTarget::FramelessPath { .. }));
+
+        let query = SidebandTarget::RealtimeQuery {
+            call_id: "rtc_2".into(),
+        };
+        assert_eq!(WireAdapter::V1.sideband_join(), SidebandJoinStyle::Query);
+        assert_eq!(
+            WireAdapter::RealtimeV2.sideband_join(),
+            SidebandJoinStyle::Query
+        );
+        assert!(matches!(query, SidebandTarget::RealtimeQuery { .. }));
+
+        // And the URL each produces for the same call id is the documented one.
+        for (target, expected) in [
+            (
+                SidebandTarget::FramelessPath {
+                    call_id: "rtc_x".into(),
+                },
+                "wss://api.openai.com/v1/live/rtc_x",
+            ),
+            (
+                SidebandTarget::RealtimeQuery {
+                    call_id: "rtc_x".into(),
+                },
+                "wss://api.openai.com/v1/realtime?intent=quicksilver&call_id=rtc_x",
+            ),
+        ] {
+            assert_eq!(
+                sideband_upstream_url("https://chatgpt.com/backend-api/codex", true, &target),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn a_backend_profile_joins_the_api_host() {
         let target = SidebandTarget::FramelessPath {
