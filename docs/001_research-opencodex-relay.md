@@ -220,6 +220,15 @@ Every emitted status with its exact message, JSON `type`, and `code`. This table
 
 JSON envelope shape in all cases: `{"error":{"message":…,"type":…,"code":…}}`.
 
+### Port-only rows
+
+One row exists in this port that has no counterpart in the source. It is listed
+here so the "every emitted response is pinned by §10" rule stays true.
+
+| Status | Message | `type` | `code` | Why |
+|---:|---|---|---|---|
+| `400` | `ambiguous Authorization: send exactly one credential` | `invalid_request_error` | `invalid_request_error` | A repeated `Authorization` header is ambiguous for a relay that must forward exactly one credential, and inspecting only the first value is a duplicate-header bypass: a caller can put a real upstream bearer first and the proxy's own admission secret second. The source reads only the first value and has no such row; refusing the request outright is a deliberate hardening, and it is called out here rather than left as an undocumented status. |
+
 Note on the `403` rows: the handler passes the *internal* type string `origin_rejected` to `formatErrorResponse`, and `classifyError` intercepts it ahead of the generic permission branch, emitting `type: "invalid_request_error"` with `code: "origin_rejected"` (`src/lib/errors.ts:136-137`, `src/server/index.ts:346`, `:598`). The wire values — not the internal token — are what this table pins.
 
 ## 11. Trust boundary

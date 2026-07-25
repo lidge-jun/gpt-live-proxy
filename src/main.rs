@@ -44,8 +44,15 @@ async fn main() -> ExitCode {
 
     tracing::info!(%bind, admission_auth = requires_auth, "gpt-live-proxy listening");
 
+    // The drain flag is set the moment a signal arrives, so requests that land
+    // during the graceful-shutdown window get 503 rather than a dropped socket.
+    let drain = state.drain.clone();
+
     if let Err(err) = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            drain.begin();
+        })
         .await
     {
         tracing::error!("server error: {err}");

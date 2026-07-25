@@ -54,6 +54,10 @@ pub enum RelayError {
     AdmissionRequired,
     #[error("gpt-live-proxy admission credentials cannot be forwarded upstream")]
     AdmissionSecretNotForwardable,
+    /// A repeated `Authorization` header. Ambiguous for a relay that must forward
+    /// exactly one credential, and a duplicate-header bypass vector.
+    #[error("ambiguous Authorization: send exactly one credential")]
+    AmbiguousAuthorization,
     #[error("origin rejected")]
     OriginBlocked(RequestKind),
     #[error("Service shutting down")]
@@ -79,6 +83,7 @@ impl RelayError {
             | Self::MultipartSessionNotString
             | Self::MultipartSessionNotJson
             | Self::NoUpstream => StatusCode::BAD_REQUEST,
+            Self::AmbiguousAuthorization => StatusCode::BAD_REQUEST,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::AdmissionRequired | Self::AdmissionSecretNotForwardable | Self::NoCredential => {
                 StatusCode::UNAUTHORIZED
@@ -315,6 +320,13 @@ mod tests {
                 "invalid_request_error",
                 "invalid_request_error",
             ),
+            (
+                RelayError::AmbiguousAuthorization,
+                400,
+                "ambiguous Authorization: send exactly one credential",
+                "invalid_request_error",
+                "invalid_request_error",
+            ),
         ]
     }
 
@@ -373,17 +385,18 @@ mod tests {
             RelayError::UpstreamFailed(_) => 12,
             RelayError::AdmissionRequired => 13,
             RelayError::AdmissionSecretNotForwardable => 14,
-            RelayError::OriginBlocked(RequestKind::Http) => 15,
-            RelayError::OriginBlocked(RequestKind::WebSocketUpgrade) => 16,
-            RelayError::Draining => 17,
-            RelayError::UpgradeFailed => 18,
-            RelayError::UnknownEndpoint { .. } => 19,
+            RelayError::AmbiguousAuthorization => 15,
+            RelayError::OriginBlocked(RequestKind::Http) => 16,
+            RelayError::OriginBlocked(RequestKind::WebSocketUpgrade) => 17,
+            RelayError::Draining => 18,
+            RelayError::UpgradeFailed => 19,
+            RelayError::UnknownEndpoint { .. } => 20,
         }
     }
 
     /// The count the table must cover. Bumping it without extending the table
     /// fails `every_variant_is_covered_by_the_contract_table`.
-    const VARIANT_COUNT: usize = 19;
+    const VARIANT_COUNT: usize = 20;
 
     /// Mechanically ties the table to the enum: adding a variant breaks compilation
     /// of `discriminant`, and deleting a row from the table breaks this test.

@@ -4,9 +4,11 @@
 //! citations into the upstream architecture record. Where this relay deliberately
 //! preserves a quirk of the original rather than "improving" it, the code says so.
 
+pub mod admission;
 pub mod app;
 pub mod config;
 pub mod error;
 
+pub use admission::DrainState;
 pub use config::{AccountId, BearerToken, Config, UpstreamProfile};
 pub use error::{RelayError, RequestKind};
