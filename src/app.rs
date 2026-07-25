@@ -57,7 +57,31 @@ fn protected_routes(state: AppState) -> Router<AppState> {
     // with the unknown-endpoint 404, not axum's default 405.
     let routes = Router::<AppState>::new()
         .route("/v1/live", any(call_create_dispatch))
-        .route("/v1/realtime/calls", any(call_create_dispatch));
+        .route("/v1/realtime/calls", any(call_create_dispatch))
+        // Sideband joins. Registered here so they inherit the boundary, which
+        // also gives them the upgrade-specific 403 wording automatically.
+        // Both slash forms are registered: axum treats them as distinct routes,
+        // so the parser's trailing-slash tolerance would otherwise be dead code.
+        // `any` rather than `get`, so a non-upgrade method reaches the handler
+        // and receives the contract's 404 instead of axum's 405.
+        .route(
+            "/v1/live/{call_id}",
+            any(crate::live::sideband::handle_sideband),
+        )
+        .route(
+            "/v1/live/{call_id}/",
+            any(crate::live::sideband::handle_sideband),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}",
+            any(crate::live::sideband::handle_sideband),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}/",
+            any(crate::live::sideband::handle_sideband),
+        )
+        .route("/v1/realtime", any(crate::live::sideband::handle_sideband))
+        .route("/v1/realtime/", any(crate::live::sideband::handle_sideband));
 
     // The probe exists ONLY under `cfg(test)`: it gives the layer something to
     // wrap before the relay routes exist, without shipping a real endpoint.
