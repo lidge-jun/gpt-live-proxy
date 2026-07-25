@@ -381,6 +381,10 @@ async fn call_create_logs_carry_the_contract_fields_and_no_secrets() {
     let sink = logs.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(move || sink.clone())
+        // CI colourizes by default, and the escape codes land between the span
+        // name and its brace, which breaks the CLOSE-line matcher below. Locally
+        // this is a no-op because there is no TTY.
+        .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         // Render span fields, so the assertions below test the SPAN contract
         // rather than the terminal event's own fields.
@@ -447,6 +451,10 @@ async fn sideband_logs_carry_the_span_contract() {
     let sink = logs.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(move || sink.clone())
+        // CI colourizes by default, and the escape codes land between the span
+        // name and its brace, which breaks the CLOSE-line matcher below. Locally
+        // this is a no-op because there is no TTY.
+        .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .finish();
