@@ -8,7 +8,9 @@ pub mod admission;
 pub mod app;
 pub mod config;
 pub mod error;
+pub mod wire;
 
 pub use admission::DrainState;
 pub use config::{AccountId, BearerToken, Config, UpstreamProfile};
 pub use error::{RelayError, RequestKind};
+pub use wire::{SidebandJoinStyle, WireAdapter};
