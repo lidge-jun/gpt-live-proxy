@@ -1,0 +1,34 @@
+[package]
+name = "gpt-live-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A faithful standalone relay for the GPT-Live / OpenAI Realtime voice protocol"
+license = "MIT"
+repository = "https://github.com/lidge-jun/gpt-live-proxy"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio-util = "0.7"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# reqwest 0.13 renamed the TLS features: `rustls` + `webpki-roots`, not `rustls-tls`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2", "stream"] }
+http = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+multer = "3.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+subtle = "2"
+percent-encoding = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
