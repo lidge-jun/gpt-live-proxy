@@ -12,6 +12,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::config::UpstreamProfile;
 use crate::error::RelayError;
+use crate::realtime::contract::{ApiDialect, CredentialPolicy, ProtocolSelection};
 use crate::wire::WireAdapter;
 
 /// The only client headers forwarded upstream.
@@ -102,6 +103,57 @@ pub fn merge_upstream_headers(
     Ok(out)
 }
 
+/// Build and validate headers for a centrally classified private call-create.
+///
+/// Unlike the older sideband merge, call-create has an exact dialect contract:
+/// one non-empty `openai-alpha` value must agree with the classifier. The
+/// resulting map is passed into the handler, so neither dialect nor credentials
+/// are inferred a second time after body admission.
+pub fn private_call_headers(
+    client: &HeaderMap,
+    profile: &UpstreamProfile,
+    selection: &ProtocolSelection,
+) -> Result<HeaderMap, RelayError> {
+    if selection.credential != CredentialPolicy::Managed {
+        return Err(RelayError::UnsupportedRealtimeCapability);
+    }
+    let adapter = match selection.dialect {
+        ApiDialect::QuicksilverV1 => WireAdapter::V1,
+        ApiDialect::Frameless => WireAdapter::FramelessBidi,
+        ApiDialect::OfficialGa => return Err(RelayError::UnsupportedRealtimeCapability),
+    };
+
+    for name in CLIENT_PROTOCOL_HEADERS {
+        let values = client.get_all(name);
+        if values.iter().count() > 1 || values.iter().any(|value| value.to_str().is_err()) {
+            return Err(RelayError::InvalidRealtimeHeader);
+        }
+    }
+    let content_types = client.get_all(http::header::CONTENT_TYPE);
+    if content_types.iter().count() != 1
+        || content_types.iter().any(|value| value.to_str().is_err())
+    {
+        return Err(RelayError::InvalidRealtimeHeader);
+    }
+    let alpha = client
+        .get("openai-alpha")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if alpha != adapter.openai_alpha() {
+        return Err(RelayError::UnsupportedRealtimeCapability);
+    }
+
+    let mut out = merge_upstream_headers(client, profile, Some(adapter))?;
+    out.insert(
+        http::header::CONTENT_TYPE,
+        client
+            .get(http::header::CONTENT_TYPE)
+            .expect("validated exactly one content-type")
+            .clone(),
+    );
+    Ok(out)
+}
+
 /// True when a header name is proxy-owned. Used by tests and diagnostics.
 pub fn is_proxy_owned(name: &str) -> bool {
     PROXY_OWNED
@@ -113,6 +165,7 @@ pub fn is_proxy_owned(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{AccountId, BearerToken};
+    use crate::realtime::contract::{CredentialPolicy, SessionKind, Transport};
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -137,6 +190,53 @@ mod tests {
         UpstreamProfile::ApiKeyManaged {
             base_url: "https://api.openai.com/v1".into(),
             auth: BearerToken::new("sk-test-key"),
+        }
+    }
+
+    fn private_selection(dialect: ApiDialect) -> ProtocolSelection {
+        ProtocolSelection {
+            dialect,
+            transport: Transport::WebRtcCall,
+            session_kind: SessionKind::Opaque,
+            credential: CredentialPolicy::Managed,
+        }
+    }
+
+    #[test]
+    fn private_call_headers_require_one_alpha_matching_the_classification() {
+        for (dialect, alpha) in [
+            (ApiDialect::QuicksilverV1, "quicksilver=v1"),
+            (ApiDialect::Frameless, "quicksilver=v2"),
+        ] {
+            let client = headers(&[
+                ("openai-alpha", alpha),
+                ("content-type", "multipart/form-data; boundary=x"),
+                ("x-session-id", "sess"),
+            ]);
+            let out = private_call_headers(&client, &keyed_profile(), &private_selection(dialect))
+                .unwrap();
+            assert_eq!(out.get("openai-alpha").unwrap(), alpha);
+            assert_eq!(out.get("x-session-id").unwrap(), "sess");
+        }
+
+        for client in [
+            HeaderMap::new(),
+            headers(&[
+                ("openai-alpha", "quicksilver=v1"),
+                ("content-type", "multipart/form-data; boundary=x"),
+            ]),
+            headers(&[
+                ("openai-alpha", "quicksilver=v2"),
+                ("openai-alpha", "quicksilver=v2"),
+                ("content-type", "multipart/form-data; boundary=x"),
+            ]),
+        ] {
+            assert!(private_call_headers(
+                &client,
+                &keyed_profile(),
+                &private_selection(ApiDialect::Frameless),
+            )
+            .is_err());
         }
     }
 

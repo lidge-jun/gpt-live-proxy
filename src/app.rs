@@ -71,7 +71,7 @@ fn protected_routes(state: AppState) -> Router<AppState> {
     // `any` rather than `post`: the contract answers a non-POST on these paths
     // with the unknown-endpoint 404, not axum's default 405.
     let routes = Router::<AppState>::new()
-        .route("/v1/live", any(call_create_dispatch))
+        .route("/v1/live", any(crate::realtime::http::handle))
         .route("/v1/realtime/calls", any(crate::realtime::http::handle))
         .route(
             "/v1/realtime/calls/{call_id}/accept",
@@ -179,26 +179,6 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Exists only to prove the layer wraps whatever is registered beside it.
 #[cfg(test)]
 const BOUNDARY_PROBE_PATH: &str = "/v1/__boundary_probe";
-
-/// Dispatch by method so a non-POST yields the contract's 404 rather than a 405.
-async fn call_create_dispatch(
-    state: State<AppState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: axum::body::Body,
-) -> Response {
-    let uri_path = uri.path().to_string();
-    if method != Method::POST {
-        return RelayError::UnknownEndpoint {
-            method: method.to_string(),
-            path: uri.path().to_string(),
-        }
-        .into_response();
-    }
-    let path = crate::live::call_create::RequestPath::from(uri_path);
-    crate::live::handle_call_create(state, method, path, headers, body).await
-}
 
 #[cfg(test)]
 async fn boundary_probe() -> Response {

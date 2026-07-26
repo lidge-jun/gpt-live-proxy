@@ -1,9 +1,10 @@
 //! Call-create URL construction.
 //!
-//! The AVAS decision belongs to [`WireAdapter`]; this module only assembles the
-//! path and appends what the adapter says applies (docs/020).
+//! The classified private dialect owns the path/query matrix. Official GA URLs
+//! are built by `realtime::http` and never enter this module.
 
-use crate::wire::{WireAdapter, AVAS_QUERY};
+use crate::realtime::contract::ApiDialect;
+use crate::wire::AVAS_QUERY;
 
 /// Append the AVAS pair unless the URL already carries **both** parameters.
 ///
@@ -19,35 +20,30 @@ pub fn with_avas_query(url: &str) -> String {
     format!("{url}{separator}{AVAS_QUERY}")
 }
 
-/// `{base minus a trailing /v1}/v1/realtime/calls` plus the AVAS query.
-pub fn keyed_call_create_url(base: &str) -> String {
-    let root = strip_v1_suffix(base);
-    with_avas_query(&format!("{root}/v1/realtime/calls"))
-}
-
-/// The forwarding path.
+/// Build one centrally classified private call-create target.
 ///
-/// A backend-shaped base posts to `{base}/realtime/calls`; a direct API base
-/// uses the separate Frameless `/live` contract. Whether the AVAS query applies
-/// is the adapter's decision, and an unknown adapter falls back to the profile
-/// default — which is what the source does, since it never inspects
-/// `openai-alpha`.
-pub fn forward_call_create_url(
-    base: &str,
-    backend_shape: bool,
-    adapter: Option<WireAdapter>,
-) -> String {
-    let root = base.trim_end_matches('/');
+/// Backend-shaped ChatGPT traffic uses its private `/realtime/calls` endpoint;
+/// both source-proven private dialects carry AVAS there. Direct API-key traffic
+/// keeps the dialect split: V1 uses `/v1/realtime/calls` + AVAS, while Frameless
+/// uses `/v1/live` with no query.
+pub fn private_call_create_url(base: &str, backend_shape: bool, dialect: ApiDialect) -> String {
     if backend_shape {
-        let url = format!("{root}/realtime/calls");
-        let wants = adapter.is_none_or(|a| a.wants_avas_query(true));
-        return if wants { with_avas_query(&url) } else { url };
+        debug_assert!(dialect != ApiDialect::OfficialGa);
+        return with_avas_query(&format!("{}/realtime/calls", base.trim_end_matches('/')));
     }
-    let url = format!("{root}/live");
-    if adapter.is_some_and(|a| a.wants_avas_query(false)) {
-        with_avas_query(&url)
-    } else {
-        url
+
+    match dialect {
+        ApiDialect::QuicksilverV1 => {
+            let root = strip_v1_suffix(base);
+            with_avas_query(&format!("{root}/v1/realtime/calls"))
+        }
+        ApiDialect::Frameless => {
+            let root = strip_v1_suffix(base);
+            format!("{root}/v1/live")
+        }
+        ApiDialect::OfficialGa => {
+            unreachable!("official GA call-create URLs belong to realtime::http")
+        }
     }
 }
 
@@ -62,15 +58,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_keyed_url_matches_the_contract() {
+    fn api_key_v1_uses_realtime_calls_with_avas() {
         assert_eq!(
-            keyed_call_create_url("https://api.openai.com/v1"),
+            private_call_create_url(
+                "https://api.openai.com/v1",
+                false,
+                ApiDialect::QuicksilverV1,
+            ),
             "https://api.openai.com/v1/realtime/calls?intent=quicksilver&architecture=avas"
         );
     }
 
     #[test]
-    fn the_keyed_url_tolerates_base_variations() {
+    fn api_key_v1_tolerates_base_variations() {
         for base in [
             "https://api.openai.com/v1",
             "https://api.openai.com/v1/",
@@ -78,7 +78,7 @@ mod tests {
             "https://api.openai.com/",
         ] {
             assert_eq!(
-                keyed_call_create_url(base),
+                private_call_create_url(base, false, ApiDialect::QuicksilverV1),
                 "https://api.openai.com/v1/realtime/calls?intent=quicksilver&architecture=avas",
                 "base {base}"
             );
@@ -86,51 +86,32 @@ mod tests {
     }
 
     #[test]
-    fn the_chatgpt_backend_url_matches_the_contract() {
-        assert_eq!(
-            forward_call_create_url("https://chatgpt.com/backend-api/codex", true, None),
-            "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
-        );
+    fn backend_private_dialects_share_the_source_proven_avas_target() {
+        for dialect in [ApiDialect::QuicksilverV1, ApiDialect::Frameless] {
+            assert_eq!(
+                private_call_create_url(
+                    "https://chatgpt.com/backend-api/codex",
+                    true,
+                    dialect,
+                ),
+                "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+            );
+        }
     }
 
     #[test]
-    fn a_direct_frameless_base_posts_to_live_without_the_avas_query() {
-        assert_eq!(
-            forward_call_create_url(
-                "https://api.openai.com/v1",
-                false,
-                Some(WireAdapter::FramelessBidi)
-            ),
-            "https://api.openai.com/v1/live"
-        );
-    }
-
-    /// V1 carries the query on every base, including a non-backend one.
-    #[test]
-    fn v1_carries_the_avas_query_even_on_a_direct_base() {
-        assert_eq!(
-            forward_call_create_url("https://api.openai.com/v1", false, Some(WireAdapter::V1)),
-            "https://api.openai.com/v1/live?intent=quicksilver&architecture=avas"
-        );
-    }
-
-    /// The builder and the adapter must never disagree about the AVAS decision.
-    #[test]
-    fn the_builder_agrees_with_the_adapter_truth_table() {
-        for adapter in [
-            WireAdapter::V1,
-            WireAdapter::FramelessBidi,
-            WireAdapter::RealtimeV2,
+    fn api_key_frameless_uses_live_without_a_query() {
+        for base in [
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+            "https://api.openai.com",
+            "https://api.openai.com/",
         ] {
-            for backend_shape in [true, false] {
-                let url =
-                    forward_call_create_url("https://host.test/base", backend_shape, Some(adapter));
-                assert_eq!(
-                    url.contains(AVAS_QUERY),
-                    adapter.wants_avas_query(backend_shape),
-                    "{adapter:?} backend_shape={backend_shape} produced {url}"
-                );
-            }
+            assert_eq!(
+                private_call_create_url(base, false, ApiDialect::Frameless),
+                "https://api.openai.com/v1/live",
+                "base {base}"
+            );
         }
     }
 

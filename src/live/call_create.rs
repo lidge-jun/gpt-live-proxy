@@ -10,12 +10,12 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 use crate::app::AppState;
 use crate::error::RelayError;
-use crate::live::{body, headers, url};
+use crate::live::{body, url};
+use crate::realtime::contract::{ApiDialect, ProtocolSelection};
 use crate::relay::body::read_capped;
 use crate::relay::http::{
     begin_exchange, spawn_execute, ExchangeLifecycle, ExchangeTerminal, OpaqueResponse,
 };
-use crate::wire::WireAdapter;
 
 /// Response headers relayed back downstream. Everything else — cookies, request
 /// ids, cache and retry headers — is dropped.
@@ -40,7 +40,8 @@ pub async fn handle_call_create(
     State(state): State<AppState>,
     method: Method,
     path: RequestPath,
-    request_headers: HeaderMap,
+    selection: ProtocolSelection,
+    mut upstream_headers: HeaderMap,
     request_body: Body,
 ) -> Response {
     let started = std::time::Instant::now();
@@ -52,24 +53,16 @@ pub async fn handle_call_create(
         "upstream",
         upstream_host_of(config.upstream.base_url()).as_str(),
     );
-    let inbound_content_type = request_headers
+    debug_assert!(matches!(
+        selection.dialect,
+        ApiDialect::QuicksilverV1 | ApiDialect::Frameless
+    ));
+    let inbound_content_type = upstream_headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or(DEFAULT_CONTENT_TYPE)
         .to_string();
-
-    // Observed only; never written back into the outgoing map.
-    let adapter = request_headers
-        .get("openai-alpha")
-        .and_then(|v| v.to_str().ok())
-        .and_then(WireAdapter::from_openai_alpha);
     let backend_shape = config.upstream.uses_backend_shape();
-    let keyed = config.upstream.is_keyed();
-    let mut upstream_headers =
-        match headers::merge_upstream_headers(&request_headers, &config.upstream, adapter) {
-            Ok(headers) => headers,
-            Err(err) => return failed(err, started, ExchangeTerminal::Failed),
-        };
 
     // Installed before the body read, so a client that vanishes mid-body is
     // observed by the same mechanism as one that vanishes mid-response.
@@ -107,7 +100,7 @@ pub async fn handle_call_create(
     };
 
     let (outbound_body, outbound_content_type) =
-        if !keyed && backend_shape && body::is_multipart(&inbound_content_type) {
+        if backend_shape && body::is_multipart(&inbound_content_type) {
             match body::backend_json_from_multipart(body_bytes, &inbound_content_type).await {
                 Ok((rewritten, content_type)) => (rewritten, content_type.to_string()),
                 Err(err) => {
@@ -116,15 +109,13 @@ pub async fn handle_call_create(
                 }
             }
         } else {
-            // The keyed path forwards the original bytes and boundary verbatim.
+            // Direct API-shaped targets forward the original bytes and boundary
+            // verbatim, independently of which profile variant supplied auth.
             (body_bytes, inbound_content_type)
         };
 
-    let target = if keyed {
-        url::keyed_call_create_url(config.upstream.base_url())
-    } else {
-        url::forward_call_create_url(config.upstream.base_url(), backend_shape, adapter)
-    };
+    let target =
+        url::private_call_create_url(config.upstream.base_url(), backend_shape, selection.dialect);
 
     if let Ok(value) = HeaderValue::from_str(&outbound_content_type) {
         // Proxy-owned, applied last so neither client nor provider can override it.

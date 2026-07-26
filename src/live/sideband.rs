@@ -25,6 +25,13 @@ impl SidebandTarget {
             | Self::RealtimeQuery { call_id } => call_id,
         }
     }
+
+    fn adapter(&self) -> WireAdapter {
+        match self {
+            Self::FramelessPath { .. } => WireAdapter::FramelessBidi,
+            Self::RealtimeCallsPath { .. } | Self::RealtimeQuery { .. } => WireAdapter::V1,
+        }
+    }
 }
 
 /// Percent-decode a path segment.
@@ -138,6 +145,28 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
+/// Resolve the private protocol only when the path and `openai-alpha` form one
+/// unambiguous pair. This runs before upgrade extraction, permit acquisition,
+/// and upstream header construction so malformed negotiation is zero-contact.
+fn private_adapter(
+    headers: &HeaderMap,
+    target: &SidebandTarget,
+) -> Result<WireAdapter, RelayError> {
+    let mut values = headers.get_all("openai-alpha").iter();
+    let value = values.next().ok_or(RelayError::InvalidRealtimeHeader)?;
+    if values.next().is_some() {
+        return Err(RelayError::InvalidRealtimeHeader);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| RelayError::InvalidRealtimeHeader)?;
+    let adapter = WireAdapter::from_openai_alpha(value).ok_or(RelayError::InvalidRealtimeHeader)?;
+    if adapter != target.adapter() {
+        return Err(RelayError::InvalidRealtimeHeader);
+    }
+    Ok(adapter)
+}
+
 /// `GET /v1/live/{callId}`, `/v1/realtime/calls/{callId}`, `/v1/realtime?call_id=`.
 ///
 /// Registered inside the protected subrouter, so the trust boundary — including
@@ -169,6 +198,11 @@ pub async fn handle_sideband(
         return unknown();
     }
 
+    let adapter = match private_adapter(&request_headers, &target) {
+        Ok(adapter) => adapter,
+        Err(error) => return error.into_response(),
+    };
+
     // Browser credential subprotocols belong exclusively to the public GA
     // surface. Reject them before taking a permit or contacting a private
     // upstream, including on the historical path aliases.
@@ -192,10 +226,11 @@ pub async fn handle_sideband(
     .max_frame_size(cap);
 
     let config = state.config.clone();
-    let upstream_headers = match merge_upstream_headers(&request_headers, &config.upstream, None) {
-        Ok(headers) => headers,
-        Err(err) => return err.into_response(),
-    };
+    let upstream_headers =
+        match merge_upstream_headers(&request_headers, &config.upstream, Some(adapter)) {
+            Ok(headers) => headers,
+            Err(err) => return err.into_response(),
+        };
 
     let join_style = match &target {
         SidebandTarget::FramelessPath { .. } => "frameless_path",
@@ -203,19 +238,15 @@ pub async fn handle_sideband(
         SidebandTarget::RealtimeQuery { .. } => "realtime_query",
     };
 
-    // The inbound path is the authority here: the relay learns the join style
-    // from what the client asked for, not from a negotiated adapter. The
-    // `WireAdapter` mapping is the same rule expressed from the adapter side,
-    // and `sideband_join_agrees_with_the_adapter` pins them together so the two
-    // cannot drift.
-    debug_assert!(matches!(
-        (&target, WireAdapter::FramelessBidi.sideband_join()),
-        (
-            SidebandTarget::FramelessPath { .. },
-            SidebandJoinStyle::Path
-        ) | (SidebandTarget::RealtimeCallsPath { .. }, _)
-            | (SidebandTarget::RealtimeQuery { .. }, _)
-    ));
+    debug_assert_eq!(
+        adapter.sideband_join(),
+        match target {
+            SidebandTarget::FramelessPath { .. } => SidebandJoinStyle::Path,
+            SidebandTarget::RealtimeCallsPath { .. } | SidebandTarget::RealtimeQuery { .. } => {
+                SidebandJoinStyle::Query
+            }
+        }
+    );
 
     let upstream_url = sideband_upstream_url(
         config.upstream.base_url(),
@@ -344,6 +375,45 @@ mod tests {
                 call_id: "rtc_abc".into()
             })
         );
+    }
+
+    #[test]
+    fn private_path_and_alpha_matrix_is_exact() {
+        let frameless = SidebandTarget::FramelessPath {
+            call_id: "rtc_f".into(),
+        };
+        let realtime_calls = SidebandTarget::RealtimeCallsPath {
+            call_id: "rtc_c".into(),
+        };
+        let realtime_query = SidebandTarget::RealtimeQuery {
+            call_id: "rtc_q".into(),
+        };
+
+        for (target, alpha, expected) in [
+            (&frameless, Some("quicksilver=v2"), true),
+            (&frameless, Some("quicksilver=v1"), false),
+            (&realtime_calls, Some("quicksilver=v1"), true),
+            (&realtime_calls, Some("quicksilver=v2"), false),
+            (&realtime_query, Some("quicksilver=v1"), true),
+            (&realtime_query, Some("quicksilver=v2"), false),
+            (&frameless, Some("quicksilver=v9"), false),
+            (&frameless, None, false),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(alpha) = alpha {
+                headers.insert("openai-alpha", alpha.parse().unwrap());
+            }
+            assert_eq!(
+                private_adapter(&headers, target).is_ok(),
+                expected,
+                "target={target:?} alpha={alpha:?}"
+            );
+        }
+
+        let mut repeated = HeaderMap::new();
+        repeated.append("openai-alpha", "quicksilver=v2".parse().unwrap());
+        repeated.append("openai-alpha", "quicksilver=v2".parse().unwrap());
+        assert!(private_adapter(&repeated, &frameless).is_err());
     }
 
     #[test]

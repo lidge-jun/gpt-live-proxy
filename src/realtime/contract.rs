@@ -178,7 +178,14 @@ pub fn classify(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, ContractErr
 }
 
 pub fn classify_rest(facts: &RouteFacts<'_>) -> Result<ClassifiedRest, RestContractError> {
-    let operation = parse_rest_path(facts.path)?;
+    // `/v1/live` is the private Frameless call-create alias. It deliberately
+    // enters the same classifier as the official REST surface instead of
+    // bypassing validation in a legacy handler.
+    let operation = if facts.path == "/v1/live" {
+        RestOperation::CreateCall
+    } else {
+        parse_rest_path(facts.path)?
+    };
     if facts.method != Method::POST {
         return Err(RestContractError::MethodNotAllowed);
     }
@@ -197,12 +204,29 @@ pub fn classify_rest(facts: &RouteFacts<'_>) -> Result<ClassifiedRest, RestContr
 fn classify_rest_call_create(
     facts: &RouteFacts<'_>,
 ) -> Result<ProtocolSelection, RestContractError> {
+    let dialect = match facts.path {
+        "/v1/live" => match private_dialect(facts.openai_alpha) {
+            Some(ApiDialect::Frameless) => ApiDialect::Frameless,
+            _ => return Err(RestContractError::PrivateDialectNotSupported),
+        },
+        "/v1/realtime/calls" => match private_dialect(facts.openai_alpha) {
+            Some(ApiDialect::Frameless) => {
+                return Err(RestContractError::PrivateDialectNotSupported);
+            }
+            Some(ApiDialect::QuicksilverV1) => ApiDialect::QuicksilverV1,
+            _ => ApiDialect::OfficialGa,
+        },
+        _ => return Err(RestContractError::UnknownRoute),
+    };
+
     let raw_sdp = match media_type(facts.content_type) {
         Some(value) if value.eq_ignore_ascii_case("multipart/form-data") => false,
         Some(value) if value.eq_ignore_ascii_case("application/sdp") => true,
         _ => return Err(RestContractError::UnsupportedContentType),
     };
-    let dialect = private_dialect(facts.openai_alpha).unwrap_or(ApiDialect::OfficialGa);
+    if dialect != ApiDialect::OfficialGa && raw_sdp {
+        return Err(RestContractError::UnsupportedContentType);
+    }
     let credential = if dialect != ApiDialect::OfficialGa {
         match facts.credential_mode {
             UpstreamCredentialMode::Managed => CredentialPolicy::Managed,
@@ -583,12 +607,7 @@ mod tests {
                 "application/sdp",
                 Some("quicksilver=v2"),
                 UpstreamCredentialMode::Managed,
-                Ok(selection(
-                    ApiDialect::Frameless,
-                    Transport::WebRtcCall,
-                    SessionKind::Opaque,
-                    CredentialPolicy::Managed,
-                )),
+                Err(ContractError::PrivateDialectNotSupported),
             ),
             (
                 "multipart/form-data; boundary=x",
@@ -600,7 +619,7 @@ mod tests {
                 "multipart/form-data; boundary=x",
                 Some("quicksilver=v2"),
                 UpstreamCredentialMode::Client,
-                Err(ContractError::PrivateDialectRequiresManaged),
+                Err(ContractError::PrivateDialectNotSupported),
             ),
             (
                 "multipart/form-data; boundary=x",
@@ -640,6 +659,57 @@ mod tests {
                 "content_type={content_type:?} alpha={alpha:?} mode={mode:?}"
             );
         }
+
+        let frameless = |content_type, alpha, mode| {
+            classify(&facts(
+                &Method::POST,
+                "/v1/live",
+                &empty,
+                Some(content_type),
+                alpha,
+                mode,
+            ))
+        };
+        assert_eq!(
+            frameless(
+                "multipart/form-data; boundary=x",
+                Some("quicksilver=v2"),
+                UpstreamCredentialMode::Managed,
+            ),
+            Ok(selection(
+                ApiDialect::Frameless,
+                Transport::WebRtcCall,
+                SessionKind::Opaque,
+                CredentialPolicy::Managed,
+            ))
+        );
+        assert_eq!(
+            frameless(
+                "application/sdp",
+                Some("quicksilver=v2"),
+                UpstreamCredentialMode::Managed,
+            ),
+            Err(ContractError::UnsupportedContentType)
+        );
+        for alpha in [None, Some("future=v9"), Some("quicksilver=v1")] {
+            assert_eq!(
+                frameless(
+                    "multipart/form-data; boundary=x",
+                    alpha,
+                    UpstreamCredentialMode::Managed,
+                ),
+                Err(ContractError::PrivateDialectNotSupported),
+                "alpha={alpha:?}"
+            );
+        }
+        assert_eq!(
+            frameless(
+                "multipart/form-data; boundary=x",
+                Some("quicksilver=v2"),
+                UpstreamCredentialMode::Client,
+            ),
+            Err(ContractError::PrivateDialectRequiresManaged)
+        );
     }
 
     #[test]

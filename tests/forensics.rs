@@ -10,7 +10,17 @@ use futures_util::{SinkExt, StreamExt};
 use gpt_live_proxy::app::{router, AppState};
 use gpt_live_proxy::config::{BearerToken, Config, UpstreamProfile};
 use gpt_live_proxy::observability::{Direction, FrameLogger};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+fn frameless_request(url: String) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    let mut request = url.into_client_request().expect("frameless request");
+    request.headers_mut().insert(
+        "openai-alpha",
+        "quicksilver=v2".parse().expect("static alpha"),
+    );
+    request
+}
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("gpt-live-forensics-{}", std::process::id()));
@@ -214,9 +224,10 @@ async fn a_live_relay_logs_both_directions_and_excludes_keepalives() {
     // A synchronous logger: the test can read the file without racing a writer.
     let proxy = start_proxy(&start_echo_upstream().await, FrameLogger::new(&path)).await;
 
-    let (mut client, _) = tokio_tungstenite::connect_async(format!("{proxy}/v1/live/rtc_log"))
-        .await
-        .expect("upgrade");
+    let (mut client, _) =
+        tokio_tungstenite::connect_async(frameless_request(format!("{proxy}/v1/live/rtc_log")))
+            .await
+            .expect("upgrade");
 
     // A ping must not appear in the log at all.
     client
@@ -265,9 +276,10 @@ async fn a_live_relay_survives_an_unwritable_log() {
     )
     .await;
 
-    let (mut client, _) = tokio_tungstenite::connect_async(format!("{proxy}/v1/live/rtc_fail"))
-        .await
-        .expect("upgrade");
+    let (mut client, _) =
+        tokio_tungstenite::connect_async(frameless_request(format!("{proxy}/v1/live/rtc_fail")))
+            .await
+            .expect("upgrade");
 
     for index in 0..5 {
         client
@@ -402,7 +414,8 @@ async fn call_create_logs_carry_the_contract_fields_and_no_secrets() {
         // read, so this observability contract belongs on `/v1/live`.
         let _ = reqwest::Client::new()
             .post(format!("{proxy_http}/v1/live"))
-            .header("content-type", "application/octet-stream")
+            .header("openai-alpha", "quicksilver=v2")
+            .header("content-type", "multipart/form-data; boundary=forensics")
             .header("authorization", "Bearer client-token-should-not-appear")
             .body(vec![b'x'; 32 * 1024 * 1024])
             .send()
@@ -463,9 +476,11 @@ async fn sideband_logs_carry_the_span_contract() {
         let _guard = tracing::subscriber::set_default(subscriber);
         let proxy = start_proxy(&upstream, FrameLogger::disabled()).await;
 
-        let (mut client, _) = tokio_tungstenite::connect_async(format!("{proxy}/v1/live/rtc_span"))
-            .await
-            .expect("upgrade");
+        let (mut client, _) = tokio_tungstenite::connect_async(frameless_request(format!(
+            "{proxy}/v1/live/rtc_span"
+        )))
+        .await
+        .expect("upgrade");
         client
             .send(ClientMessage::Text("ping".into()))
             .await

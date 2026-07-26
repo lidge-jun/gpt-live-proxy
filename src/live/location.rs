@@ -4,6 +4,8 @@
 //! `Location` header (docs/000 §2.6). The relay passes the header through
 //! untouched, so this exists for tests and for any future client mode.
 
+use crate::realtime::path::validate_call_id;
+
 /// Extract the call id: drop the query, then scan path segments right to left
 /// and take the first that looks like a call id.
 pub fn parse_call_id(location: &str) -> Option<String> {
@@ -15,10 +17,11 @@ pub fn parse_call_id(location: &str) -> Option<String> {
 
 /// Either `rtc_` with a non-empty suffix, or a 36-character 8-4-4-4-12 hex UUID.
 fn is_call_id_segment(segment: &str) -> bool {
-    if let Some(suffix) = segment.strip_prefix("rtc_") {
-        return !suffix.is_empty();
-    }
-    is_hex_uuid(segment)
+    let known_shape = segment
+        .strip_prefix("rtc_")
+        .is_some_and(|suffix| !suffix.is_empty())
+        || is_hex_uuid(segment);
+    known_shape && validate_call_id(segment).is_ok()
 }
 
 fn is_hex_uuid(segment: &str) -> bool {
@@ -78,6 +81,27 @@ mod tests {
     #[test]
     fn a_bare_rtc_prefix_is_not_a_call_id() {
         assert_eq!(parse_call_id("/v1/live/rtc_"), None);
+    }
+
+    #[test]
+    fn rtc_candidates_use_the_shared_character_and_length_rules() {
+        for candidate in [
+            "rtc_has.dot".to_string(),
+            "rtc_has+plus".to_string(),
+            "rtc_has%2Fslash".to_string(),
+            format!("rtc_{}", "x".repeat(125)),
+        ] {
+            assert_eq!(
+                parse_call_id(&format!("/v1/live/{candidate}")),
+                None,
+                "candidate={candidate:?}"
+            );
+        }
+        let at_limit = format!("rtc_{}", "x".repeat(124));
+        assert_eq!(
+            parse_call_id(&format!("/v1/live/{at_limit}")).as_deref(),
+            Some(at_limit.as_str())
+        );
     }
 
     #[test]

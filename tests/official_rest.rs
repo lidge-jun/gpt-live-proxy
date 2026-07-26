@@ -513,7 +513,7 @@ async fn profile_dispatch_is_atomic_and_private_failures_never_contact_upstream(
     assert_eq!(captures.count(), 0);
 
     let private = reqwest::Client::new()
-        .post(format!("{}/v1/realtime/calls", chatgpt.base))
+        .post(format!("{}/v1/live", chatgpt.base))
         .header("content-type", content_type)
         .header("openai-alpha", "quicksilver=v2")
         .body(body)
@@ -535,7 +535,7 @@ async fn profile_dispatch_is_atomic_and_private_failures_never_contact_upstream(
         HeaderValue::from_static("multipart/form-data; boundary=x"),
     );
     let repeated_private = reqwest::Client::new()
-        .post(format!("{}/v1/realtime/calls", chatgpt.base))
+        .post(format!("{}/v1/live", chatgpt.base))
         .headers(repeated_alpha)
         .body("--x--\r\n")
         .send()

@@ -12,6 +12,10 @@ Work-phase: `wp4-webrtc-sideband`. Depends on `090`, `100`, and `110`.
 | ChatGPT V1/Frameless | private selection | backend `/realtime/calls` | AVAS where source requires | multipart rewritten to JSON |
 | ChatGPT GA V2 | `/v1/realtime/calls` + GA session | unsupported | none | reject before contact |
 
+Raw `application/sdp` is an official-GA ephemeral credential shape only.
+Private V1 and Frameless call-create require multipart; accepting raw SDP there
+would discard the session/body semantics their adapters require.
+
 The current Codex snapshot rejects RealtimeV2 only on its private AVAS/ChatGPT
 path. The current public OpenAI API supports `gpt-realtime-2.1` WebRTC; API-key
 GA mode must not inherit that private rejection.
@@ -31,6 +35,10 @@ Consume `ProtocolSelection` for private routes. Remove the `keyed` shortcut that
 currently sends every API-key profile to AVAS. Keep multipart→backend JSON and
 top-level ID removal only for the body the proxy rebuilds.
 
+`/v1/live` enters through the same central classification boundary. An
+absent/unknown private dialect, raw SDP, or any non-multipart content type is a
+zero-contact rejection rather than a legacy passthrough.
+
 ### VERIFY `src/realtime/websocket.rs` and private sideband adapter
 
 `110` already owns the standalone/existing-call dispatcher and both public and
@@ -40,6 +48,11 @@ private pump policies: official GA sideband is exactly
 `Location` remains opaque downstream, while the new end-to-end test extracts
 its call ID and proves the `100` call-create result composes with the `110`
 join.
+
+Private sideband paths and `openai-alpha` are one contract: V1 and Frameless
+path/header combinations cannot be crossed. A mismatch fails before upgrade,
+permit acquisition, or upstream contact. Any Location helper used internally or
+by tests delegates validation to the shared call-ID authority.
 
 ### MODIFY `tests/call_create.rs`, `tests/sideband.rs`
 

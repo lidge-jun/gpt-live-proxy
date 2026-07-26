@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, Method, Uri};
 
 use crate::app::AppState;
-use crate::config::{UpstreamCredentialMode, UpstreamProfile};
+use crate::config::UpstreamProfile;
 use crate::error::RelayError;
 use crate::live::call_create::RequestPath;
 use crate::realtime::contract::{classify_rest, ApiDialect, RouteFacts};
@@ -60,26 +60,31 @@ pub async fn handle(
     // Header construction is also validation. It runs before lifecycle setup,
     // permit acquisition, and body read so a bad credential never consumes
     // request capacity or reaches the upstream.
-    let upstream_headers = match crate::realtime::headers::upstream_headers(
-        &request_headers,
-        &state.config.upstream,
-        &classified.selection,
-    ) {
+    let upstream_headers = match if classified.selection.dialect == ApiDialect::OfficialGa {
+        crate::realtime::headers::upstream_headers(
+            &request_headers,
+            &state.config.upstream,
+            &classified.selection,
+        )
+    } else {
+        crate::live::headers::private_call_headers(
+            &request_headers,
+            &state.config.upstream,
+            &classified.selection,
+        )
+    } {
         Ok(headers) => headers,
         Err(error) => return error.into_response(),
     };
 
     if classified.selection.dialect != ApiDialect::OfficialGa {
-        debug_assert_eq!(
-            state.config.upstream.credential_mode(),
-            UpstreamCredentialMode::Managed
-        );
         debug_assert!(matches!(&classified.operation, RestOperation::CreateCall));
         return crate::live::handle_call_create(
             State(state),
             method,
             RequestPath::from(path.to_string()),
-            request_headers,
+            classified.selection,
+            upstream_headers,
             request_body,
         )
         .await;

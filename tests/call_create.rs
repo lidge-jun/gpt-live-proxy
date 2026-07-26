@@ -120,6 +120,72 @@ async fn a_chatgpt_backend_call_rewrites_multipart_into_json() {
 }
 
 #[tokio::test]
+async fn backend_base_shape_rewrites_even_for_an_api_key_profile() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
+        base_url: format!("{upstream}/backend-api/codex"),
+        auth: BearerToken::new("sk-test"),
+    }))
+    .await;
+
+    let (body, content_type) = multipart_body(Some(r#"{"id":"strip-me","voice":"cove"}"#));
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let captured = captures.last();
+    assert_eq!(
+        captured.uri,
+        "/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+    );
+    assert_eq!(
+        captured.headers.get("content-type").unwrap(),
+        "application/json"
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(sent["sdp"], "v=0\r\na=offer");
+    assert_eq!(sent["session"]["voice"], "cove");
+    assert!(sent["session"].get("id").is_none());
+}
+
+#[tokio::test]
+async fn direct_base_shape_preserves_multipart_even_for_a_chatgpt_profile() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ChatGptBackend {
+        base_url: upstream.clone(),
+        auth: BearerToken::new("chatgpt-token"),
+        account_id: None,
+    }))
+    .await;
+
+    let (body, content_type) = multipart_body(Some(r#"{"id":"keep-me","voice":"cove"}"#));
+    let expected_body = body.clone();
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
+        .header("content-type", &content_type)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let captured = captures.last();
+    assert_eq!(captured.uri, "/v1/live");
+    assert_eq!(captured.body.as_ref(), expected_body.as_slice());
+    assert_eq!(
+        captured.headers.get("content-type").unwrap(),
+        content_type.as_str()
+    );
+}
+
+#[tokio::test]
 async fn an_api_key_call_preserves_multipart_verbatim() {
     let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
     let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
@@ -159,6 +225,75 @@ async fn an_api_key_call_preserves_multipart_verbatim() {
         captured.headers.get("authorization").unwrap(),
         "Bearer sk-test"
     );
+}
+
+#[tokio::test]
+async fn api_key_v1_uses_realtime_calls_with_avas_and_preserves_the_body() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
+        base_url: format!("{upstream}/v1"),
+        auth: BearerToken::new("sk-test"),
+    }))
+    .await;
+
+    let (body, content_type) = multipart_body(Some(r#"{"voice":"cove"}"#));
+    let expected_body = body.clone();
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/realtime/calls"))
+        .header("openai-alpha", "quicksilver=v1")
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let captured = captures.last();
+    assert_eq!(
+        captured.uri,
+        "/v1/realtime/calls?intent=quicksilver&architecture=avas"
+    );
+    assert_eq!(captured.body.as_ref(), expected_body.as_slice());
+    assert_eq!(
+        captured.headers.get("openai-alpha").unwrap(),
+        "quicksilver=v1"
+    );
+}
+
+#[tokio::test]
+async fn chatgpt_v1_uses_backend_avas_and_rewrites_the_body() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ChatGptBackend {
+        base_url: format!("{upstream}/backend-api/codex"),
+        auth: BearerToken::new("chatgpt-token"),
+        account_id: None,
+    }))
+    .await;
+
+    let (body, content_type) = multipart_body(Some(r#"{"id":"sess_v1","voice":"cove"}"#));
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/realtime/calls"))
+        .header("openai-alpha", "quicksilver=v1")
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let captured = captures.last();
+    assert_eq!(
+        captured.uri,
+        "/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+    );
+    assert_eq!(
+        captured.headers.get("content-type").unwrap(),
+        "application/json"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(body["sdp"], "v=0\r\na=offer");
+    assert_eq!(body["session"]["voice"], "cove");
+    assert!(body["session"].get("id").is_none());
 }
 
 #[tokio::test]
@@ -222,36 +357,12 @@ async fn protocol_headers_are_forwarded_and_credentials_are_replaced() {
 }
 
 #[tokio::test]
-async fn an_absent_protocol_header_is_not_invented() {
+async fn an_absent_private_protocol_header_is_rejected_before_contact() {
     let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
     let proxy = start_proxy(config_for(UpstreamProfile::ChatGptBackend {
         base_url: format!("{upstream}/backend-api/codex"),
         auth: BearerToken::new("t"),
         account_id: None,
-    }))
-    .await;
-
-    let (body, content_type) = multipart_body(None);
-    let _ = reqwest::Client::new()
-        .post(format!("{proxy}/v1/live"))
-        .header("content-type", content_type)
-        .body(body)
-        .send()
-        .await
-        .expect("call-create");
-
-    assert!(
-        captures.last().headers.get("openai-alpha").is_none(),
-        "the relay must not negotiate a protocol the client never asked for"
-    );
-}
-
-#[tokio::test]
-async fn only_content_type_and_location_come_back() {
-    let (upstream, _captures) = start_upstream(UpstreamBehavior::default()).await;
-    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
-        base_url: format!("{upstream}/v1"),
-        auth: BearerToken::new("sk-test"),
     }))
     .await;
 
@@ -264,7 +375,125 @@ async fn only_content_type_and_location_come_back() {
         .await
         .expect("call-create");
 
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(value["error"]["code"], "unsupported_realtime_capability");
+    assert_eq!(captures.count(), 0);
+}
+
+#[tokio::test]
+async fn private_call_create_rejects_wrong_path_dialect_and_content_before_contact() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ChatGptBackend {
+        base_url: format!("{upstream}/backend-api/codex"),
+        auth: BearerToken::new("t"),
+        account_id: None,
+    }))
+    .await;
+    let (multipart, multipart_type) = multipart_body(None);
+
+    let rows = [
+        (
+            "/v1/live",
+            Some("quicksilver=v2"),
+            "application/sdp",
+            b"v=0".as_slice(),
+            "invalid_request_error",
+        ),
+        (
+            "/v1/realtime/calls",
+            Some("quicksilver=v1"),
+            "application/sdp",
+            b"v=0".as_slice(),
+            "invalid_request_error",
+        ),
+        (
+            "/v1/live",
+            Some("quicksilver=v1"),
+            multipart_type.as_str(),
+            multipart.as_slice(),
+            "unsupported_realtime_capability",
+        ),
+        (
+            "/v1/realtime/calls",
+            Some("quicksilver=v2"),
+            multipart_type.as_str(),
+            multipart.as_slice(),
+            "unsupported_realtime_capability",
+        ),
+        (
+            "/v1/live",
+            Some("future=v9"),
+            multipart_type.as_str(),
+            multipart.as_slice(),
+            "unsupported_realtime_capability",
+        ),
+        (
+            "/v1/live",
+            Some("quicksilver=v2"),
+            "text/plain",
+            b"not multipart".as_slice(),
+            "invalid_request_error",
+        ),
+        (
+            "/v1/realtime/calls",
+            None,
+            multipart_type.as_str(),
+            multipart.as_slice(),
+            "unsupported_realtime_capability",
+        ),
+    ];
+
+    for (path, alpha, content_type, body, expected_code) in rows {
+        let mut request = reqwest::Client::new()
+            .post(format!("{proxy}{path}"))
+            .header("content-type", content_type)
+            .body(body.to_vec());
+        if let Some(alpha) = alpha {
+            request = request.header("openai-alpha", alpha);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "path={path}");
+        let value: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(value["error"]["code"], expected_code, "path={path}");
+    }
+
+    let duplicate_alpha = reqwest::Client::new()
+        .post(format!("{proxy}/v1/live"))
+        .header("content-type", multipart_type)
+        .header("openai-alpha", "quicksilver=v2")
+        .header("openai-alpha", "quicksilver=v2")
+        .body(multipart)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_alpha.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = duplicate_alpha.json().await.unwrap();
+    assert_eq!(value["error"]["code"], "invalid_request_error");
+    assert_eq!(captures.count(), 0);
+}
+
+#[tokio::test]
+async fn only_content_type_and_location_come_back() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
+        base_url: format!("{upstream}/v1"),
+        auth: BearerToken::new("sk-test"),
+    }))
+    .await;
+
+    let (body, content_type) = multipart_body(None);
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .await
+        .expect("call-create");
+
     assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(captures.last().uri, "/v1/live");
     assert_eq!(
         response.headers().get("location").unwrap(),
         "/v1/realtime/calls/rtc_test_call"
@@ -406,6 +635,7 @@ async fn an_sdp_only_body_is_accepted() {
     let (body, content_type) = multipart_body(None);
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
         .header("content-type", content_type)
         .body(body)
         .send()
@@ -431,6 +661,7 @@ async fn a_malformed_multipart_body_is_rejected_with_the_exact_message() {
     let (body, content_type) = multipart_body(Some("{not json"));
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
         .header("content-type", content_type)
         .body(body)
         .send()
@@ -468,6 +699,7 @@ async fn an_upstream_timeout_reports_504() {
     let (body, content_type) = multipart_body(None);
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
         .header("content-type", content_type)
         .body(body)
         .send()
@@ -497,6 +729,7 @@ async fn an_unreachable_upstream_reports_502() {
     let (body, content_type) = multipart_body(None);
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
         .header("content-type", content_type)
         .body(body)
         .send()
@@ -523,7 +756,8 @@ async fn an_oversized_body_is_rejected_before_reaching_the_upstream() {
 
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
-        .header("content-type", "application/octet-stream")
+        .header("openai-alpha", "quicksilver=v2")
+        .header("content-type", "multipart/form-data; boundary=cap")
         .body(vec![b'x'; 4096])
         .send()
         .await
@@ -547,7 +781,7 @@ async fn a_legacy_partial_body_times_out_before_upstream_contact_and_recovers() 
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let partial = format!(
-        "POST /v1/live HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/octet-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+        "POST /v1/live HTTP/1.1\r\nHost: {addr}\r\nOpenAI-Alpha: quicksilver=v2\r\nContent-Type: multipart/form-data; boundary=partial\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
     );
     stream.write_all(partial.as_bytes()).await.unwrap();
     let mut response = Vec::new();
@@ -565,7 +799,8 @@ async fn a_legacy_partial_body_times_out_before_upstream_contact_and_recovers() 
 
     let recovered = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
-        .header("content-type", "application/octet-stream")
+        .header("openai-alpha", "quicksilver=v2")
+        .header("content-type", "multipart/form-data; boundary=recovered")
         .body("complete")
         .send()
         .await
@@ -605,6 +840,7 @@ async fn an_oversized_upstream_response_reports_502() {
     let (body, content_type) = multipart_body(None);
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
         .header("content-type", content_type)
         .body(body)
         .send()
@@ -640,6 +876,7 @@ async fn a_response_at_exactly_the_cap_is_relayed() {
     let (body, content_type) = multipart_body(None);
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
         .header("content-type", content_type)
         .body(body)
         .send()
@@ -664,6 +901,7 @@ async fn an_invalid_configured_credential_fails_loudly() {
     let (body, content_type) = multipart_body(None);
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
         .header("content-type", content_type)
         .body(body)
         .send()
@@ -708,6 +946,7 @@ async fn a_downstream_disconnect_cancels_the_upstream_call() {
     let handle = tokio::spawn(
         reqwest::Client::new()
             .post(format!("{proxy}/v1/live"))
+            .header("openai-alpha", "quicksilver=v2")
             .header("content-type", content_type)
             .body(body)
             .send(),
