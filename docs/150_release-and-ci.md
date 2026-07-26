@@ -18,13 +18,19 @@ new work-phase; release does not patch around a failed gate.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo +1.86 check --locked
-npm ci --prefix conformance/node
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo +1.86 check --locked --all-targets --all-features
+npm ci --prefix conformance/node --ignore-scripts --no-audit --no-fund
+npm ls --prefix conformance/node openai ws --depth=0
+cargo build --locked --bin gpt-live-proxy
+node scripts/verify-official-fixtures.mjs
 npm test --prefix conformance/node
+node scripts/mutation-check.mjs
 actionlint
-gitleaks detect --source . --no-banner --redact
+gitleaks git . --no-banner --redact
+cargo audit
+npm audit --prefix conformance/node --audit-level=high --ignore-scripts
 git diff --check
 git status --short --branch
 ```
