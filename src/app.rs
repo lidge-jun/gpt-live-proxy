@@ -8,6 +8,7 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use http::{HeaderMap, Method, StatusCode, Uri};
 use serde_json::json;
+use tokio::sync::Semaphore;
 
 use crate::admission::{cors, guard, DrainState};
 use crate::config::Config;
@@ -17,6 +18,7 @@ use crate::error::{RelayError, RequestKind};
 pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
+    pub active_requests: Arc<Semaphore>,
     pub drain: DrainState,
     /// Service-owned so shutdown can flush it and so tests can inject one.
     pub frame_log: crate::observability::FrameLogger,
@@ -26,6 +28,7 @@ impl AppState {
     /// Fallible because `ClientBuilder::build` can fail on TLS backend
     /// initialization; startup reports that rather than panicking.
     pub fn new(config: Config) -> Result<Self, reqwest::Error> {
+        let active_requests = Arc::new(Semaphore::new(config.limits.active_requests));
         Ok(Self {
             config: Arc::new(config),
             // The relay owns its own timeouts per request, so the client carries none.
@@ -35,6 +38,7 @@ impl AppState {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            active_requests,
             drain: DrainState::new(),
             frame_log: crate::observability::FrameLogger::from_env_owned(),
         })
@@ -65,7 +69,40 @@ fn protected_routes(state: AppState) -> Router<AppState> {
     // with the unknown-endpoint 404, not axum's default 405.
     let routes = Router::<AppState>::new()
         .route("/v1/live", any(call_create_dispatch))
-        .route("/v1/realtime/calls", any(call_create_dispatch))
+        .route("/v1/realtime/calls", any(crate::realtime::http::handle))
+        .route(
+            "/v1/realtime/calls/{call_id}/accept",
+            any(crate::realtime::http::handle),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}/reject",
+            any(crate::realtime::http::handle),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}/refer",
+            any(crate::realtime::http::handle),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}/hangup",
+            any(crate::realtime::http::handle),
+        )
+        .route(
+            "/v1/realtime/client_secrets",
+            any(crate::realtime::http::handle),
+        )
+        .route("/v1/realtime/sessions", any(crate::realtime::http::handle))
+        .route(
+            "/v1/realtime/transcription_sessions",
+            any(crate::realtime::http::handle),
+        )
+        .route(
+            "/v1/realtime/translations/client_secrets",
+            any(crate::realtime::http::handle),
+        )
+        .route(
+            "/v1/realtime/translations/calls",
+            any(crate::realtime::http::handle),
+        )
         // Sideband joins. Registered here so they inherit the boundary, which
         // also gives them the upgrade-specific 403 wording automatically.
         // Both slash forms are registered: axum treats them as distinct routes,

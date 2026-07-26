@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 
+use crate::realtime::path::validate_call_id;
 use crate::wire::SIDEBAND_API_ROOT;
 
-/// Maximum decoded call-id length, matching `^[A-Za-z0-9_-]{1,128}$`.
-pub const MAX_CALL_ID_LEN: usize = 128;
+pub use crate::realtime::path::MAX_CALL_ID_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebandTarget {
@@ -25,17 +25,6 @@ impl SidebandTarget {
             | Self::RealtimeQuery { call_id } => call_id,
         }
     }
-}
-
-/// A hand-rolled check rather than a regex dependency: the pattern is fixed and
-/// small enough that a scan is clearer than a compiled expression.
-fn is_valid_call_id(candidate: &str) -> bool {
-    if candidate.is_empty() || candidate.len() > MAX_CALL_ID_LEN {
-        return false;
-    }
-    candidate
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Percent-decode a path segment.
@@ -64,7 +53,8 @@ pub fn parse_sideband_target(
             return None;
         }
         let call_id = decode_segment(rest)?;
-        return is_valid_call_id(&call_id).then_some(SidebandTarget::FramelessPath { call_id });
+        validate_call_id(&call_id).ok()?;
+        return Some(SidebandTarget::FramelessPath { call_id });
     }
 
     if let Some(rest) = trimmed.strip_prefix("/v1/realtime/calls/") {
@@ -72,13 +62,15 @@ pub fn parse_sideband_target(
             return None;
         }
         let call_id = decode_segment(rest)?;
-        return is_valid_call_id(&call_id).then_some(SidebandTarget::RealtimeCallsPath { call_id });
+        validate_call_id(&call_id).ok()?;
+        return Some(SidebandTarget::RealtimeCallsPath { call_id });
     }
 
     if trimmed == "/v1/realtime" {
         // Query values arrive already decoded.
-        let call_id = query.get("call_id")?.trim().to_string();
-        return is_valid_call_id(&call_id).then_some(SidebandTarget::RealtimeQuery { call_id });
+        let call_id = query.get("call_id")?.to_string();
+        validate_call_id(&call_id).ok()?;
+        return Some(SidebandTarget::RealtimeQuery { call_id });
     }
 
     None
@@ -279,6 +271,7 @@ pub async fn handle_sideband(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realtime::path::parse_rest_path;
 
     fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -358,6 +351,65 @@ mod tests {
     fn a_missing_or_empty_query_id_is_rejected() {
         assert!(parse_sideband_target("/v1/realtime", &HashMap::new()).is_none());
         assert!(parse_sideband_target("/v1/realtime", &query(&[("call_id", "  ")])).is_none());
+        assert!(parse_sideband_target("/v1/realtime", &query(&[("call_id", " rtc_a ")])).is_none());
+    }
+
+    #[test]
+    fn rest_controls_and_sideband_paths_share_decoded_call_id_decisions() {
+        let cases = [
+            ("a".to_string(), true),
+            ("rtc_A0-z".to_string(), true),
+            ("%72tc_1".to_string(), true),
+            ("x".repeat(MAX_CALL_ID_LEN), true),
+            (String::new(), false),
+            ("x".repeat(MAX_CALL_ID_LEN + 1), false),
+            ("has.dot".to_string(), false),
+            ("has+plus".to_string(), false),
+            ("has%2Fslash".to_string(), false),
+            ("%252F".to_string(), false),
+            ("%ED%95%9C%EA%B8%80".to_string(), false),
+            ("%zz".to_string(), false),
+            ("%FF".to_string(), false),
+        ];
+
+        for (raw_call_id, expected) in cases {
+            let rest = parse_rest_path(&format!("/v1/realtime/calls/{raw_call_id}/accept")).is_ok();
+            let frameless =
+                parse_sideband_target(&format!("/v1/live/{raw_call_id}"), &HashMap::new())
+                    .is_some();
+            let realtime_calls = parse_sideband_target(
+                &format!("/v1/realtime/calls/{raw_call_id}"),
+                &HashMap::new(),
+            )
+            .is_some();
+
+            assert_eq!(rest, expected, "REST raw_call_id={raw_call_id:?}");
+            assert_eq!(frameless, rest, "Frameless raw_call_id={raw_call_id:?}");
+            assert_eq!(
+                realtime_calls, rest,
+                "Realtime calls raw_call_id={raw_call_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_query_ids_use_the_same_shared_validator() {
+        for decoded in [
+            "rtc_a".to_string(),
+            "x".repeat(MAX_CALL_ID_LEN),
+            String::new(),
+            " rtc_a ".to_string(),
+            "x".repeat(MAX_CALL_ID_LEN + 1),
+            "has/slash".to_string(),
+            "한글".to_string(),
+        ] {
+            assert_eq!(
+                parse_sideband_target("/v1/realtime", &query(&[("call_id", decoded.as_str())]))
+                    .is_some(),
+                validate_call_id(&decoded).is_ok(),
+                "decoded call_id={decoded:?}"
+            );
+        }
     }
 
     #[test]

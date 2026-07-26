@@ -1,24 +1,20 @@
 //! The call-create handler.
 //!
-//! Cancellation ownership is the subtle part. If the upstream call lived inside
-//! the handler future, a client disconnect would drop that future and it could
-//! never observe its own cancellation — so the work is spawned, and a guard the
-//! handler owns records the outcome when it drops.
-
-use std::sync::{Arc, Mutex};
+//! Cancellation ownership is the subtle part. The shared HTTP exchange owns the
+//! spawned send/read work while this handler keeps only Live-specific policy.
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use tokio_util::sync::CancellationToken;
+use http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 use crate::app::AppState;
-use crate::config::Config;
 use crate::error::RelayError;
 use crate::live::{body, headers, url};
 use crate::relay::body::read_capped;
+use crate::relay::http::{
+    begin_exchange, spawn_execute, ExchangeLifecycle, ExchangeTerminal, OpaqueResponse,
+};
 use crate::wire::WireAdapter;
 
 /// Response headers relayed back downstream. Everything else — cookies, request
@@ -27,79 +23,7 @@ const RELAY_HEADERS: [&str; 2] = ["content-type", "location"];
 
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    InFlight,
-    Completed(u16),
-    TimedOut,
-    Failed(String),
-    ClientCanceled,
-}
-
-/// A one-shot outcome slot. Terminal transitions apply only from `InFlight`, so
-/// whichever side finishes first wins and a late completion can never overwrite
-/// a recorded cancellation.
-#[derive(Debug, Clone, Default)]
-pub struct CallOutcome(Arc<Mutex<Option<Outcome>>>);
-
-impl CallOutcome {
-    pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(Some(Outcome::InFlight))))
-    }
-
-    /// Returns true when this call actually performed the transition.
-    pub fn finish(&self, next: Outcome) -> bool {
-        let Ok(mut slot) = self.0.lock() else {
-            return false;
-        };
-        if matches!(slot.as_ref(), Some(Outcome::InFlight)) {
-            *slot = Some(next);
-            return true;
-        }
-        false
-    }
-
-    pub fn get(&self) -> Outcome {
-        self.0
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .unwrap_or(Outcome::InFlight)
-    }
-}
-
-/// Owns both halves of cancellation: it records the outcome and cancels the
-/// token, so a dropped handler future actually stops the spawned work.
-pub struct OutcomeGuard {
-    slot: CallOutcome,
-    token: CancellationToken,
-}
-
-impl OutcomeGuard {
-    pub fn new(slot: CallOutcome, token: CancellationToken) -> Self {
-        Self { slot, token }
-    }
-}
-
-impl Drop for OutcomeGuard {
-    fn drop(&mut self) {
-        if self.slot.finish(Outcome::ClientCanceled) {
-            self.token.cancel();
-        }
-    }
-}
-
-/// A fully materialized upstream response: nothing droppable is left behind.
-pub struct UpstreamResult {
-    pub status: StatusCode,
-    pub headers: HeaderMap,
-    pub body: Bytes,
-}
-
-/// `POST /v1/live` and `POST /v1/realtime/calls`.
-///
-/// Both paths are handled identically; `/v1/realtime/calls` is the public
-/// Realtime alias.
+/// Legacy `POST /v1/live`, also used by recognized private call-create dialects.
 #[tracing::instrument(
     name = "call_create",
     skip_all,
@@ -108,7 +32,8 @@ pub struct UpstreamResult {
         path = %path,
         upstream = tracing::field::Empty,
         status = tracing::field::Empty,
-        elapsed_ms = tracing::field::Empty
+        elapsed_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty
     )
 )]
 pub async fn handle_call_create(
@@ -133,38 +58,61 @@ pub async fn handle_call_create(
         .unwrap_or(DEFAULT_CONTENT_TYPE)
         .to_string();
 
-    let slot = CallOutcome::new();
-    let token = CancellationToken::new();
-    // Installed before the body read, so a client that vanishes mid-body is
-    // observed by the same mechanism as one that vanishes mid-response.
-    let _guard = OutcomeGuard::new(slot.clone(), token.clone());
-
-    debug_assert_eq!(method, Method::POST);
-
-    let body_bytes = match read_capped(request_body, config.limits.request_bytes).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            slot.finish(Outcome::Failed(err.message()));
-            return failed(err, started);
-        }
-    };
-
     // Observed only; never written back into the outgoing map.
     let adapter = request_headers
         .get("openai-alpha")
         .and_then(|v| v.to_str().ok())
         .and_then(WireAdapter::from_openai_alpha);
-
     let backend_shape = config.upstream.uses_backend_shape();
     let keyed = config.upstream.is_keyed();
+    let mut upstream_headers =
+        match headers::merge_upstream_headers(&request_headers, &config.upstream, adapter) {
+            Ok(headers) => headers,
+            Err(err) => return failed(err, started, ExchangeTerminal::Failed),
+        };
+
+    // Installed before the body read, so a client that vanishes mid-body is
+    // observed by the same mechanism as one that vanishes mid-response.
+    let (lifecycle, _guard) = begin_exchange();
+    debug_assert_eq!(method, Method::POST);
+
+    let permit = match state.active_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            lifecycle.finish(ExchangeTerminal::Failed);
+            return failed(
+                RelayError::TooManyActiveRealtimeRequests,
+                started,
+                lifecycle.terminal(),
+            );
+        }
+    };
+
+    let body_bytes = match tokio::time::timeout(
+        config.limits.request_read_timeout,
+        read_capped(request_body, config.limits.request_bytes),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => {
+            finish_error(&lifecycle, &err);
+            return failed(err, started, lifecycle.terminal());
+        }
+        Err(_) => {
+            let err = RelayError::RealtimeRequestBodyTimeout;
+            finish_error(&lifecycle, &err);
+            return failed(err, started, lifecycle.terminal());
+        }
+    };
 
     let (outbound_body, outbound_content_type) =
         if !keyed && backend_shape && body::is_multipart(&inbound_content_type) {
             match body::backend_json_from_multipart(body_bytes, &inbound_content_type).await {
                 Ok((rewritten, content_type)) => (rewritten, content_type.to_string()),
                 Err(err) => {
-                    slot.finish(Outcome::Failed(err.message()));
-                    return failed(err, started);
+                    finish_error(&lifecycle, &err);
+                    return failed(err, started, lifecycle.terminal());
                 }
             }
         } else {
@@ -178,28 +126,33 @@ pub async fn handle_call_create(
         url::forward_call_create_url(config.upstream.base_url(), backend_shape, adapter)
     };
 
-    let mut upstream_headers =
-        match headers::merge_upstream_headers(&request_headers, &config.upstream, adapter) {
-            Ok(headers) => headers,
-            Err(err) => {
-                slot.finish(Outcome::Failed(err.message()));
-                return failed(err, started);
-            }
-        };
     if let Ok(value) = HeaderValue::from_str(&outbound_content_type) {
         // Proxy-owned, applied last so neither client nor provider can override it.
         upstream_headers.insert(http::header::CONTENT_TYPE, value);
     }
 
     let upstream_host_for_log = upstream_host_of(&target);
-    let task = spawn_upstream(
+    let request = match state
+        .http
+        .request(method, target)
+        .headers(upstream_headers)
+        .body(outbound_body)
+        .build()
+    {
+        Ok(request) => request,
+        Err(err) => {
+            let err = RelayError::UpstreamFailed(err.to_string());
+            finish_error(&lifecycle, &err);
+            return failed(err, started, lifecycle.terminal());
+        }
+    };
+    let task = spawn_execute(
         state.http.clone(),
-        config.clone(),
-        target,
-        upstream_headers,
-        outbound_body,
-        slot.clone(),
-        token,
+        request,
+        config.limits.response_bytes,
+        config.limits.upstream_timeout,
+        lifecycle.clone(),
+        permit,
     );
 
     // Already recorded at entry from the configured base. Re-record only if the
@@ -215,6 +168,7 @@ pub async fn handle_call_create(
             let span = tracing::Span::current();
             span.record("status", result.status.as_u16());
             span.record("elapsed_ms", elapsed_ms);
+            span.record("outcome", terminal_label(lifecycle.terminal()));
             tracing::info!(
                 status = result.status.as_u16(),
                 elapsed_ms,
@@ -222,102 +176,14 @@ pub async fn handle_call_create(
             );
             relay_response(result)
         }
-        Ok(Err(err)) => failed(err, started),
+        Ok(Err(err)) => failed(err, started, lifecycle.terminal()),
         // The task was cancelled or panicked; the guard already recorded why,
         // but the response still gets its log line like every other path.
-        Err(_) => failed(RelayError::ClientCanceled, started),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_upstream(
-    client: reqwest::Client,
-    config: Arc<Config>,
-    target: String,
-    headers: HeaderMap,
-    body: Bytes,
-    slot: CallOutcome,
-    token: CancellationToken,
-) -> tokio::task::JoinHandle<Result<UpstreamResult, RelayError>> {
-    tokio::spawn(async move {
-        let work = async {
-            let response = client
-                .post(&target)
-                .headers(headers)
-                .body(body)
-                .send()
-                .await
-                .map_err(|err| RelayError::UpstreamFailed(err.to_string()))?;
-
-            let status = response.status();
-            let mut relayed = HeaderMap::new();
-            for name in RELAY_HEADERS {
-                if let Some(value) = response.headers().get(name) {
-                    if !value.is_empty() {
-                        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
-                            relayed.insert(name, value.clone());
-                        }
-                    }
-                }
-            }
-
-            // Buffering belongs to this task: leaving it in the handler would
-            // put a droppable await back on the cancellation path.
-            //
-            // Read incrementally and stop the moment the cap is crossed. Calling
-            // `bytes()` first would buffer an unbounded response into memory
-            // before deciding to reject it, which is a denial-of-service rather
-            // than a 502.
-            let mut buffer = bytes::BytesMut::new();
-            let mut response = response;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|err| RelayError::UpstreamFailed(err.to_string()))?
-            {
-                // Empty data frames carry no payload but would still grow a
-                // per-chunk vector, so they are skipped rather than retained.
-                if chunk.is_empty() {
-                    continue;
-                }
-                if buffer.len().saturating_add(chunk.len()) > config.limits.response_bytes {
-                    return Err(RelayError::ResponseTooLarge(
-                        buffer.len().saturating_add(chunk.len()),
-                    ));
-                }
-                // One growing buffer, not a vector of chunks: retaining each
-                // chunk separately lets many tiny frames cost far more in
-                // metadata than the cap allows in payload.
-                buffer.extend_from_slice(&chunk);
-            }
-            let bytes = buffer.freeze();
-
-            Ok(UpstreamResult {
-                status,
-                headers: relayed,
-                body: bytes,
-            })
-        };
-
-        tokio::select! {
-            biased;
-            () = token.cancelled() => Err(RelayError::ClientCanceled),
-            result = tokio::time::timeout(config.limits.upstream_timeout, work) => match result {
-                Ok(Ok(result)) => {
-                    slot.finish(Outcome::Completed(result.status.as_u16()));
-                    Ok(result)
-                }
-                Ok(Err(err)) => {
-                    slot.finish(Outcome::Failed(err.message()));
-                    Err(err)
-                }
-                Err(_) => {
-                    slot.finish(Outcome::TimedOut);
-                    Err(RelayError::UpstreamTimeout)
-                }
-            },
+        Err(_) => {
+            lifecycle.finish(ExchangeTerminal::Failed);
+            failed(RelayError::ClientCanceled, started, lifecycle.terminal())
         }
-    })
+    }
 }
 
 /// The inbound path, extracted so the span records the route that was actually
@@ -349,11 +215,31 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestPath {
 
 /// Emit the failure event and the response together, so no early return can
 /// produce a response without a corresponding log line.
-fn failed(err: RelayError, started: std::time::Instant) -> Response {
+fn finish_error(lifecycle: &ExchangeLifecycle, err: &RelayError) {
+    let terminal = match err {
+        RelayError::ClientCanceled => ExchangeTerminal::Canceled,
+        RelayError::UpstreamTimeout => ExchangeTerminal::TimedOut,
+        _ => ExchangeTerminal::Failed,
+    };
+    lifecycle.finish(terminal);
+}
+
+fn terminal_label(terminal: ExchangeTerminal) -> &'static str {
+    match terminal {
+        ExchangeTerminal::InFlight => "in_flight",
+        ExchangeTerminal::Completed => "completed",
+        ExchangeTerminal::Failed => "failed",
+        ExchangeTerminal::TimedOut => "timed_out",
+        ExchangeTerminal::Canceled => "client_canceled",
+    }
+}
+
+fn failed(err: RelayError, started: std::time::Instant, terminal: ExchangeTerminal) -> Response {
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let span = tracing::Span::current();
     span.record("status", err.status().as_u16());
     span.record("elapsed_ms", elapsed_ms);
+    span.record("outcome", terminal_label(terminal));
     tracing::warn!(
         status = err.status().as_u16(),
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -378,16 +264,26 @@ pub fn upstream_host_of(url: &str) -> String {
     }
 }
 
-fn relay_response(result: UpstreamResult) -> Response {
+fn relay_response(result: OpaqueResponse) -> Response {
     let mut response = Response::new(Body::from(result.body));
     *response.status_mut() = result.status;
-    *response.headers_mut() = result.headers;
+    for name in RELAY_HEADERS {
+        if let Some(value) = result.headers.get(name) {
+            if !value.is_empty() {
+                if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+                    response.headers_mut().insert(name, value.clone());
+                }
+            }
+        }
+    }
     response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use http::StatusCode;
 
     #[test]
     fn only_the_two_relay_headers_are_listed() {
@@ -418,44 +314,48 @@ mod tests {
     }
 
     #[test]
-    fn the_first_terminal_transition_wins() {
-        let slot = CallOutcome::new();
-        assert!(slot.finish(Outcome::Completed(201)));
-        assert!(!slot.finish(Outcome::ClientCanceled));
-        assert_eq!(slot.get(), Outcome::Completed(201));
-    }
-
-    #[test]
-    fn a_cancellation_cannot_be_overwritten_by_a_late_completion() {
-        let slot = CallOutcome::new();
-        assert!(slot.finish(Outcome::ClientCanceled));
-        assert!(!slot.finish(Outcome::Completed(201)));
-        assert_eq!(slot.get(), Outcome::ClientCanceled);
-    }
-
-    #[test]
-    fn dropping_the_guard_records_cancellation_and_cancels_the_token() {
-        let slot = CallOutcome::new();
-        let token = CancellationToken::new();
-        {
-            let _guard = OutcomeGuard::new(slot.clone(), token.clone());
-        }
-        assert_eq!(slot.get(), Outcome::ClientCanceled);
-        assert!(token.is_cancelled());
-    }
-
-    #[test]
-    fn dropping_the_guard_after_completion_is_a_no_op() {
-        let slot = CallOutcome::new();
-        let token = CancellationToken::new();
-        {
-            let _guard = OutcomeGuard::new(slot.clone(), token.clone());
-            slot.finish(Outcome::Completed(201));
-        }
-        assert_eq!(slot.get(), Outcome::Completed(201));
-        assert!(
-            !token.is_cancelled(),
-            "a completed call must not cancel its own token on drop"
+    fn shared_terminals_keep_live_span_labels_stable() {
+        assert_eq!(terminal_label(ExchangeTerminal::InFlight), "in_flight");
+        assert_eq!(terminal_label(ExchangeTerminal::Completed), "completed");
+        assert_eq!(terminal_label(ExchangeTerminal::Failed), "failed");
+        assert_eq!(terminal_label(ExchangeTerminal::TimedOut), "timed_out");
+        assert_eq!(
+            terminal_label(ExchangeTerminal::Canceled),
+            "client_canceled"
         );
+    }
+
+    #[test]
+    fn private_response_policy_keeps_only_content_type_and_location() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/sdp"),
+        );
+        headers.insert(
+            http::header::LOCATION,
+            HeaderValue::from_static("/v1/realtime/calls/rtc_test"),
+        );
+        headers.insert(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("private=leak"),
+        );
+
+        let response = relay_response(OpaqueResponse {
+            status: StatusCode::CREATED,
+            headers,
+            body: Bytes::from_static(b"answer"),
+        });
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "application/sdp"
+        );
+        assert_eq!(
+            response.headers()[http::header::LOCATION],
+            "/v1/realtime/calls/rtc_test"
+        );
+        assert!(!response.headers().contains_key(http::header::SET_COOKIE));
     }
 }

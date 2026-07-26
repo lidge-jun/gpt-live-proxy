@@ -11,6 +11,7 @@ use gpt_live_proxy::config::{AccountId, BearerToken, Config, UpstreamProfile};
 use gpt_live_proxy::wire::MULTIPART_BOUNDARY;
 use http::StatusCode;
 use support::{start_upstream, start_upstream_with_drop_signal, UpstreamBehavior};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn config_for(profile: UpstreamProfile) -> Config {
     let mut config = Config::from_source(|k| match k {
@@ -141,13 +142,7 @@ async fn an_api_key_call_preserves_multipart_verbatim() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let captured = captures.last();
-    assert!(
-        captured
-            .uri
-            .ends_with("/v1/realtime/calls?intent=quicksilver&architecture=avas"),
-        "unexpected upstream URI: {}",
-        captured.uri
-    );
+    assert_eq!(captured.uri, "/v1/realtime/calls");
     assert_eq!(
         captured.body.as_ref(),
         sent_body.as_slice(),
@@ -342,10 +337,11 @@ async fn a_307_is_relayed_without_replaying_body_or_credential_to_its_target() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
+    let (body, content_type) = multipart_body(None);
     let response = client
         .post(format!("{proxy}/v1/realtime/calls"))
-        .header("content-type", "application/octet-stream")
-        .body("body-that-must-not-be-replayed")
+        .header("content-type", content_type)
+        .body(body)
         .send()
         .await
         .unwrap();
@@ -363,7 +359,7 @@ async fn a_307_is_relayed_without_replaying_body_or_credential_to_its_target() {
 }
 
 #[tokio::test]
-async fn client_credential_mode_is_not_partially_activated_on_the_legacy_handler() {
+async fn client_credential_mode_relays_an_official_call_create() {
     let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
     let config = Config::from_source(|key| match key {
         "GPT_LIVE_UPSTREAM_MODE" => Some("apikey".to_string()),
@@ -383,11 +379,17 @@ async fn client_credential_mode_is_not_partially_activated_on_the_legacy_handler
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(
         captures.count(),
-        0,
-        "the legacy handler must not partially apply client credential mode"
+        1,
+        "the official client-credential request must reach the upstream once"
+    );
+    let captured = captures.last();
+    assert_eq!(captured.uri, "/v1/realtime/calls");
+    assert_eq!(
+        captured.headers.get(http::header::AUTHORIZATION).unwrap(),
+        "Bearer caller-owned-token"
     );
 }
 
@@ -529,6 +531,47 @@ async fn an_oversized_body_is_rejected_before_reaching_the_upstream() {
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(captures.count(), 0);
+}
+
+#[tokio::test]
+async fn a_legacy_partial_body_times_out_before_upstream_contact_and_recovers() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let mut config = config_for(UpstreamProfile::ApiKeyManaged {
+        base_url: format!("{upstream}/v1"),
+        auth: BearerToken::new("sk-test"),
+    });
+    config.limits.active_requests = 1;
+    config.limits.request_read_timeout = std::time::Duration::from_millis(50);
+    let proxy = start_proxy(config).await;
+    let addr: SocketAddr = proxy.strip_prefix("http://").unwrap().parse().unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let partial = format!(
+        "POST /v1/live HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/octet-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+    );
+    stream.write_all(partial.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("legacy read-timeout response stalled")
+    .unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+    assert!(response.contains("request_timeout"), "{response}");
+    assert_eq!(captures.count(), 0);
+
+    let recovered = reqwest::Client::new()
+        .post(format!("{proxy}/v1/live"))
+        .header("content-type", "application/octet-stream")
+        .body("complete")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::CREATED);
+    assert_eq!(captures.count(), 1);
 }
 
 #[tokio::test]

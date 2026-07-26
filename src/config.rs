@@ -15,6 +15,7 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Buffered upstream response cap (`GPT_LIVE_RESPONSE_MAX_BYTES`).
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ACTIVE_REQUESTS: usize = 128;
 pub const MAX_ACTIVE_CONNECTIONS: usize = 128;
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -76,6 +77,7 @@ pub struct Limits {
     pub request_bytes: usize,
     pub response_bytes: usize,
     pub websocket_frame_bytes: usize,
+    pub active_requests: usize,
     pub active_connections: usize,
     pub request_read_timeout: Duration,
     pub upstream_timeout: Duration,
@@ -89,6 +91,7 @@ impl Default for Limits {
             request_bytes: MAX_BODY_BYTES,
             response_bytes: MAX_RESPONSE_BYTES,
             websocket_frame_bytes: MAX_WEBSOCKET_FRAME_BYTES,
+            active_requests: MAX_ACTIVE_REQUESTS,
             active_connections: MAX_ACTIVE_CONNECTIONS,
             request_read_timeout: REQUEST_READ_TIMEOUT,
             upstream_timeout: UPSTREAM_TIMEOUT,
@@ -290,6 +293,21 @@ fn positive_usize(
     Ok(value)
 }
 
+fn positive_semaphore_permits(
+    raw: Option<String>,
+    key: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    let value = positive_usize(raw, key, default)?;
+    if value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::Invalid {
+            key,
+            reason: format!("must not exceed {}", tokio::sync::Semaphore::MAX_PERMITS),
+        });
+    }
+    Ok(value)
+}
+
 fn positive_millis(
     raw: Option<String>,
     key: &'static str,
@@ -425,7 +443,12 @@ impl Config {
                 "GPT_LIVE_WS_FRAME_MAX_BYTES",
                 MAX_WEBSOCKET_FRAME_BYTES,
             )?,
-            active_connections: positive_usize(
+            active_requests: positive_semaphore_permits(
+                get("GPT_LIVE_MAX_REQUESTS"),
+                "GPT_LIVE_MAX_REQUESTS",
+                MAX_ACTIVE_REQUESTS,
+            )?,
+            active_connections: positive_semaphore_permits(
                 get("GPT_LIVE_MAX_CONNECTIONS"),
                 "GPT_LIVE_MAX_CONNECTIONS",
                 MAX_ACTIVE_CONNECTIONS,
@@ -841,6 +864,7 @@ mod tests {
                 request_bytes: 16 * 1024 * 1024,
                 response_bytes: 16 * 1024 * 1024,
                 websocket_frame_bytes: 16 * 1024 * 1024,
+                active_requests: 128,
                 active_connections: 128,
                 request_read_timeout: Duration::from_secs(30),
                 upstream_timeout: Duration::from_secs(120),
@@ -857,27 +881,29 @@ mod tests {
             ("GPT_LIVE_REQUEST_MAX_BYTES", "101"),
             ("GPT_LIVE_RESPONSE_MAX_BYTES", "102"),
             ("GPT_LIVE_WS_FRAME_MAX_BYTES", "103"),
-            ("GPT_LIVE_MAX_CONNECTIONS", "104"),
-            ("GPT_LIVE_REQUEST_READ_TIMEOUT_MS", "105"),
-            ("GPT_LIVE_UPSTREAM_TIMEOUT_MS", "106"),
-            ("GPT_LIVE_WS_CONNECT_TIMEOUT_MS", "107"),
-            ("GPT_LIVE_WS_SEND_TIMEOUT_MS", "108"),
+            ("GPT_LIVE_MAX_REQUESTS", "104"),
+            ("GPT_LIVE_MAX_CONNECTIONS", "105"),
+            ("GPT_LIVE_REQUEST_READ_TIMEOUT_MS", "106"),
+            ("GPT_LIVE_UPSTREAM_TIMEOUT_MS", "107"),
+            ("GPT_LIVE_WS_CONNECT_TIMEOUT_MS", "108"),
+            ("GPT_LIVE_WS_SEND_TIMEOUT_MS", "109"),
         ]))
         .unwrap();
 
         assert_eq!(cfg.limits.request_bytes, 101);
         assert_eq!(cfg.limits.response_bytes, 102);
         assert_eq!(cfg.limits.websocket_frame_bytes, 103);
-        assert_eq!(cfg.limits.active_connections, 104);
-        assert_eq!(cfg.limits.request_read_timeout, Duration::from_millis(105));
-        assert_eq!(cfg.limits.upstream_timeout, Duration::from_millis(106));
+        assert_eq!(cfg.limits.active_requests, 104);
+        assert_eq!(cfg.limits.active_connections, 105);
+        assert_eq!(cfg.limits.request_read_timeout, Duration::from_millis(106));
+        assert_eq!(cfg.limits.upstream_timeout, Duration::from_millis(107));
         assert_eq!(
             cfg.limits.websocket_connect_timeout,
-            Duration::from_millis(107)
+            Duration::from_millis(108)
         );
         assert_eq!(
             cfg.limits.websocket_send_timeout,
-            Duration::from_millis(108)
+            Duration::from_millis(109)
         );
     }
 
@@ -887,6 +913,7 @@ mod tests {
             "GPT_LIVE_REQUEST_MAX_BYTES",
             "GPT_LIVE_RESPONSE_MAX_BYTES",
             "GPT_LIVE_WS_FRAME_MAX_BYTES",
+            "GPT_LIVE_MAX_REQUESTS",
             "GPT_LIVE_MAX_CONNECTIONS",
             "GPT_LIVE_REQUEST_READ_TIMEOUT_MS",
             "GPT_LIVE_UPSTREAM_TIMEOUT_MS",
@@ -908,6 +935,41 @@ mod tests {
                 assert!(
                     matches!(err, ConfigError::Invalid { key: actual, .. } if actual == key),
                     "{key}={bad} returned {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semaphore_limits_reject_values_that_would_panic_at_startup() {
+        for key in ["GPT_LIVE_MAX_REQUESTS", "GPT_LIVE_MAX_CONNECTIONS"] {
+            let maximum = tokio::sync::Semaphore::MAX_PERMITS.to_string();
+            let cfg = Config::from_source(|candidate| match candidate {
+                "GPT_LIVE_TOKEN" => Some("t".to_string()),
+                candidate if candidate == key => Some(maximum.clone()),
+                _ => None,
+            })
+            .unwrap();
+            let observed = if key == "GPT_LIVE_MAX_REQUESTS" {
+                cfg.limits.active_requests
+            } else {
+                cfg.limits.active_connections
+            };
+            assert_eq!(observed, tokio::sync::Semaphore::MAX_PERMITS);
+
+            for too_large in [
+                (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string(),
+                usize::MAX.to_string(),
+            ] {
+                let err = Config::from_source(|candidate| match candidate {
+                    "GPT_LIVE_TOKEN" => Some("t".to_string()),
+                    candidate if candidate == key => Some(too_large.clone()),
+                    _ => None,
+                })
+                .unwrap_err();
+                assert!(
+                    matches!(err, ConfigError::Invalid { key: actual, .. } if actual == key),
+                    "{key}={too_large} returned {err}"
                 );
             }
         }

@@ -6,7 +6,7 @@
 
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use http::{header, StatusCode};
+use http::{header, Method, StatusCode};
 use serde_json::json;
 
 /// Which surface rejected a request. The two origin rejections carry different
@@ -60,6 +60,16 @@ pub enum RelayError {
     AmbiguousAuthorization,
     #[error("invalid or repeated Realtime header")]
     InvalidRealtimeHeader,
+    #[error("invalid Realtime call_id")]
+    InvalidRealtimeCallId,
+    #[error("unsupported Realtime content type")]
+    UnsupportedRealtimeContentType,
+    #[error("Realtime operation is not supported by the configured upstream profile")]
+    UnsupportedRealtimeCapability,
+    #[error("Realtime request body timed out")]
+    RealtimeRequestBodyTimeout,
+    #[error("too many active Realtime requests")]
+    TooManyActiveRealtimeRequests,
     #[error("origin rejected")]
     OriginBlocked(RequestKind),
     #[error("Service shutting down")]
@@ -73,6 +83,27 @@ pub enum RelayError {
 }
 
 impl RelayError {
+    pub fn from_rest_contract(
+        error: crate::realtime::contract::RestContractError,
+        method: &Method,
+        path: &str,
+    ) -> Self {
+        use crate::realtime::contract::RestContractError;
+
+        match error {
+            RestContractError::UnknownRoute | RestContractError::MethodNotAllowed => {
+                Self::UnknownEndpoint {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                }
+            }
+            RestContractError::InvalidCallId => Self::InvalidRealtimeCallId,
+            RestContractError::UnsupportedContentType => Self::UnsupportedRealtimeContentType,
+            RestContractError::PrivateDialectRequiresManaged
+            | RestContractError::PrivateDialectNotSupported => Self::UnsupportedRealtimeCapability,
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -85,7 +116,13 @@ impl RelayError {
             | Self::MultipartSessionNotString
             | Self::MultipartSessionNotJson
             | Self::NoUpstream => StatusCode::BAD_REQUEST,
-            Self::AmbiguousAuthorization | Self::InvalidRealtimeHeader => StatusCode::BAD_REQUEST,
+            Self::AmbiguousAuthorization
+            | Self::InvalidRealtimeHeader
+            | Self::InvalidRealtimeCallId
+            | Self::UnsupportedRealtimeContentType
+            | Self::UnsupportedRealtimeCapability => StatusCode::BAD_REQUEST,
+            Self::RealtimeRequestBodyTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::TooManyActiveRealtimeRequests => StatusCode::TOO_MANY_REQUESTS,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::AdmissionRequired | Self::AdmissionSecretNotForwardable | Self::NoCredential => {
                 StatusCode::UNAUTHORIZED
@@ -103,6 +140,7 @@ impl RelayError {
             Self::AdmissionRequired | Self::AdmissionSecretNotForwardable | Self::NoCredential => {
                 "authentication_error"
             }
+            Self::TooManyActiveRealtimeRequests => "rate_limit_error",
             Self::ResponseTooLarge(_) | Self::UpstreamFailed(_) | Self::UpstreamTimeout => {
                 "server_error"
             }
@@ -125,6 +163,10 @@ impl RelayError {
             // `invalid_request_error` / `origin_rejected` (docs/001 §10).
             Self::OriginBlocked(_) => "origin_rejected",
             Self::UpgradeFailed => "upgrade_required",
+            Self::InvalidRealtimeCallId => "invalid_call_id",
+            Self::UnsupportedRealtimeCapability => "unsupported_realtime_capability",
+            Self::RealtimeRequestBodyTimeout => "request_timeout",
+            Self::TooManyActiveRealtimeRequests => "rate_limit_exceeded",
             _ => "invalid_request_error",
         }
     }
@@ -158,6 +200,7 @@ impl IntoResponse for RelayError {
                 .into_response();
         }
 
+        let retry_after = matches!(self, Self::TooManyActiveRealtimeRequests);
         let body = json!({
             "error": {
                 "message": self.message(),
@@ -165,7 +208,13 @@ impl IntoResponse for RelayError {
                 "code": self.error_code(),
             }
         });
-        (self.status(), Json(body)).into_response()
+        let mut response = (self.status(), Json(body)).into_response();
+        if retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -336,6 +385,41 @@ mod tests {
                 "invalid_request_error",
                 "invalid_request_error",
             ),
+            (
+                RelayError::InvalidRealtimeCallId,
+                400,
+                "invalid Realtime call_id",
+                "invalid_request_error",
+                "invalid_call_id",
+            ),
+            (
+                RelayError::UnsupportedRealtimeContentType,
+                400,
+                "unsupported Realtime content type",
+                "invalid_request_error",
+                "invalid_request_error",
+            ),
+            (
+                RelayError::UnsupportedRealtimeCapability,
+                400,
+                "Realtime operation is not supported by the configured upstream profile",
+                "invalid_request_error",
+                "unsupported_realtime_capability",
+            ),
+            (
+                RelayError::RealtimeRequestBodyTimeout,
+                408,
+                "Realtime request body timed out",
+                "invalid_request_error",
+                "request_timeout",
+            ),
+            (
+                RelayError::TooManyActiveRealtimeRequests,
+                429,
+                "too many active Realtime requests",
+                "rate_limit_error",
+                "rate_limit_exceeded",
+            ),
         ]
     }
 
@@ -401,12 +485,17 @@ mod tests {
             RelayError::UpgradeFailed => 19,
             RelayError::UnknownEndpoint { .. } => 20,
             RelayError::InvalidRealtimeHeader => 21,
+            RelayError::InvalidRealtimeCallId => 22,
+            RelayError::UnsupportedRealtimeContentType => 23,
+            RelayError::UnsupportedRealtimeCapability => 24,
+            RelayError::RealtimeRequestBodyTimeout => 25,
+            RelayError::TooManyActiveRealtimeRequests => 26,
         }
     }
 
     /// The count the table must cover. Bumping it without extending the table
     /// fails `every_variant_is_covered_by_the_contract_table`.
-    const VARIANT_COUNT: usize = 21;
+    const VARIANT_COUNT: usize = 26;
 
     /// Mechanically ties the table to the enum: adding a variant breaks compilation
     /// of `discriminant`, and deleting a row from the table breaks this test.
@@ -440,6 +529,59 @@ mod tests {
 
         let bytes = to_bytes(res.into_body(), 4096).await.expect("body");
         assert_eq!(&bytes[..], b"Service shutting down");
+    }
+
+    #[tokio::test]
+    async fn active_request_limit_has_retry_after_one() {
+        let res = RelayError::TooManyActiveRealtimeRequests.into_response();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[test]
+    fn every_rest_contract_error_has_one_wire_mapping() {
+        use crate::realtime::contract::RestContractError;
+
+        let method = Method::PATCH;
+        let path = "/v1/realtime/calls/rtc_a/accept";
+        let rows = [
+            (
+                RestContractError::UnknownRoute,
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+            ),
+            (
+                RestContractError::MethodNotAllowed,
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+            ),
+            (
+                RestContractError::InvalidCallId,
+                StatusCode::BAD_REQUEST,
+                "invalid_call_id",
+            ),
+            (
+                RestContractError::UnsupportedContentType,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                RestContractError::PrivateDialectRequiresManaged,
+                StatusCode::BAD_REQUEST,
+                "unsupported_realtime_capability",
+            ),
+            (
+                RestContractError::PrivateDialectNotSupported,
+                StatusCode::BAD_REQUEST,
+                "unsupported_realtime_capability",
+            ),
+        ];
+
+        for (contract, status, code) in rows {
+            let wire = RelayError::from_rest_contract(contract, &method, path);
+            assert_eq!(wire.status(), status, "contract={contract:?}");
+            assert_eq!(wire.error_code(), code, "contract={contract:?}");
+        }
     }
 
     #[test]

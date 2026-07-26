@@ -5,6 +5,8 @@ use thiserror::Error;
 
 use crate::config::UpstreamCredentialMode;
 
+use super::path::{parse_rest_path, PathError, RestOperation};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiDialect {
     OfficialGa,
@@ -53,6 +55,37 @@ pub struct RouteFacts<'a> {
     pub credential_mode: UpstreamCredentialMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedRest {
+    pub operation: RestOperation,
+    pub selection: ProtocolSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RestContractError {
+    #[error("unknown Realtime REST route")]
+    UnknownRoute,
+    #[error("method is not allowed for this Realtime REST route")]
+    MethodNotAllowed,
+    #[error("invalid Realtime call_id")]
+    InvalidCallId,
+    #[error("unsupported content type for this Realtime REST route")]
+    UnsupportedContentType,
+    #[error("private Realtime dialect requires managed credentials")]
+    PrivateDialectRequiresManaged,
+    #[error("private Realtime dialect is not supported on this REST route")]
+    PrivateDialectNotSupported,
+}
+
+impl From<PathError> for RestContractError {
+    fn from(error: PathError) -> Self {
+        match error {
+            PathError::UnknownRoute => Self::UnknownRoute,
+            PathError::InvalidCallId => Self::InvalidCallId,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ContractError {
     #[error("method is not allowed for this Realtime route")]
@@ -61,6 +94,8 @@ pub enum ContractError {
     UnsupportedContentType,
     #[error("unknown Realtime route")]
     UnknownRoute,
+    #[error("invalid Realtime call_id")]
+    InvalidCallId,
     #[error("Realtime query has conflicting or duplicate selectors")]
     AmbiguousQuery,
     #[error("Realtime query is missing its selector")]
@@ -71,57 +106,64 @@ pub enum ContractError {
     PrivateDialectNotSupported,
 }
 
-pub fn classify(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, ContractError> {
-    if facts.path == "/v1/realtime/calls" {
-        return classify_call_create(facts);
+impl From<RestContractError> for ContractError {
+    fn from(error: RestContractError) -> Self {
+        match error {
+            RestContractError::UnknownRoute => Self::UnknownRoute,
+            RestContractError::MethodNotAllowed => Self::MethodNotAllowed,
+            RestContractError::InvalidCallId => Self::InvalidCallId,
+            RestContractError::UnsupportedContentType => Self::UnsupportedContentType,
+            RestContractError::PrivateDialectRequiresManaged => Self::PrivateDialectRequiresManaged,
+            RestContractError::PrivateDialectNotSupported => Self::PrivateDialectNotSupported,
+        }
     }
+}
+
+pub fn classify(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, ContractError> {
     if facts.path == "/v1/realtime" {
         return classify_websocket(facts);
     }
     if facts.path == "/v1/realtime/translations" {
         return classify_translation_websocket(facts);
     }
-    if let Some(session_kind) = rest_session_kind(facts.path) {
-        if facts.method != Method::POST {
-            return Err(ContractError::MethodNotAllowed);
-        }
-        if private_dialect(facts.openai_alpha).is_some() {
-            return Err(ContractError::PrivateDialectNotSupported);
-        }
-        let credential = if facts.path == "/v1/realtime/translations/calls" {
-            match media_type(facts.content_type) {
-                Some(value) if value.eq_ignore_ascii_case("application/sdp") => {
-                    CredentialPolicy::Ephemeral
-                }
-                _ => return Err(ContractError::UnsupportedContentType),
-            }
-        } else {
-            configured_credential(facts.credential_mode)
-        };
-        return Ok(ProtocolSelection {
-            dialect: ApiDialect::OfficialGa,
-            transport: Transport::Http,
-            session_kind,
-            credential,
-        });
-    }
-    Err(ContractError::UnknownRoute)
+    classify_rest(facts)
+        .map(|classified| classified.selection)
+        .map_err(ContractError::from)
 }
 
-fn classify_call_create(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, ContractError> {
+pub fn classify_rest(facts: &RouteFacts<'_>) -> Result<ClassifiedRest, RestContractError> {
+    let operation = parse_rest_path(facts.path)?;
     if facts.method != Method::POST {
-        return Err(ContractError::MethodNotAllowed);
+        return Err(RestContractError::MethodNotAllowed);
     }
 
+    let selection = match &operation {
+        RestOperation::CreateCall => classify_rest_call_create(facts)?,
+        operation => classify_official_rest(operation, facts)?,
+    };
+
+    Ok(ClassifiedRest {
+        operation,
+        selection,
+    })
+}
+
+fn classify_rest_call_create(
+    facts: &RouteFacts<'_>,
+) -> Result<ProtocolSelection, RestContractError> {
     let raw_sdp = match media_type(facts.content_type) {
         Some(value) if value.eq_ignore_ascii_case("multipart/form-data") => false,
         Some(value) if value.eq_ignore_ascii_case("application/sdp") => true,
-        _ => return Err(ContractError::UnsupportedContentType),
+        _ => return Err(RestContractError::UnsupportedContentType),
     };
     let dialect = private_dialect(facts.openai_alpha).unwrap_or(ApiDialect::OfficialGa);
     let credential = if dialect != ApiDialect::OfficialGa {
-        require_managed(facts.credential_mode)?;
-        CredentialPolicy::Managed
+        match facts.credential_mode {
+            UpstreamCredentialMode::Managed => CredentialPolicy::Managed,
+            UpstreamCredentialMode::Client => {
+                return Err(RestContractError::PrivateDialectRequiresManaged);
+            }
+        }
     } else if raw_sdp {
         CredentialPolicy::Ephemeral
     } else {
@@ -132,6 +174,53 @@ fn classify_call_create(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, Con
         dialect,
         transport: Transport::WebRtcCall,
         session_kind: SessionKind::Opaque,
+        credential,
+    })
+}
+
+fn classify_official_rest(
+    operation: &RestOperation,
+    facts: &RouteFacts<'_>,
+) -> Result<ProtocolSelection, RestContractError> {
+    if private_dialect(facts.openai_alpha).is_some() {
+        return Err(RestContractError::PrivateDialectNotSupported);
+    }
+
+    let (session_kind, credential) = match operation {
+        RestOperation::AcceptCall { .. }
+        | RestOperation::CreateClientSecret
+        | RestOperation::CreateLegacySession => (
+            SessionKind::Realtime,
+            configured_credential(facts.credential_mode),
+        ),
+        RestOperation::CreateTranscriptionSession => (
+            SessionKind::Transcription,
+            configured_credential(facts.credential_mode),
+        ),
+        RestOperation::CreateTranslationClientSecret => (
+            SessionKind::Translation,
+            configured_credential(facts.credential_mode),
+        ),
+        RestOperation::CreateTranslationCall => {
+            match media_type(facts.content_type) {
+                Some(value) if value.eq_ignore_ascii_case("application/sdp") => {}
+                _ => return Err(RestContractError::UnsupportedContentType),
+            }
+            (SessionKind::Translation, CredentialPolicy::Ephemeral)
+        }
+        RestOperation::RejectCall { .. }
+        | RestOperation::ReferCall { .. }
+        | RestOperation::HangupCall { .. } => (
+            SessionKind::Opaque,
+            configured_credential(facts.credential_mode),
+        ),
+        RestOperation::CreateCall => unreachable!("call create has its own classifier"),
+    };
+
+    Ok(ProtocolSelection {
+        dialect: ApiDialect::OfficialGa,
+        transport: Transport::Http,
+        session_kind,
         credential,
     })
 }
@@ -335,45 +424,6 @@ fn require_managed(mode: UpstreamCredentialMode) -> Result<(), ContractError> {
     match mode {
         UpstreamCredentialMode::Managed => Ok(()),
         UpstreamCredentialMode::Client => Err(ContractError::PrivateDialectRequiresManaged),
-    }
-}
-
-fn rest_session_kind(path: &str) -> Option<SessionKind> {
-    match path {
-        "/v1/realtime/client_secrets" | "/v1/realtime/sessions" => Some(SessionKind::Realtime),
-        "/v1/realtime/transcription_sessions" => Some(SessionKind::Transcription),
-        "/v1/realtime/translations/client_secrets" | "/v1/realtime/translations/calls" => {
-            Some(SessionKind::Translation)
-        }
-        _ => control_session_kind(path),
-    }
-}
-
-fn control_session_kind(path: &str) -> Option<SessionKind> {
-    let mut segments = path.split('/');
-    match (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) {
-        (
-            Some(""),
-            Some("v1"),
-            Some("realtime"),
-            Some("calls"),
-            Some(call_id),
-            Some(action),
-            None,
-        ) if !call_id.is_empty() => match action {
-            "accept" => Some(SessionKind::Realtime),
-            "reject" | "refer" | "hangup" => Some(SessionKind::Opaque),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -720,73 +770,133 @@ mod tests {
     }
 
     #[test]
-    fn every_future_rest_path_has_an_exact_session_kind() {
+    fn all_ten_rest_operations_preserve_path_and_selection_through_classify() {
         let empty = [];
         let rows = [
-            ("/v1/realtime/client_secrets", SessionKind::Realtime),
-            ("/v1/realtime/sessions", SessionKind::Realtime),
+            (
+                "/v1/realtime/calls",
+                Some("multipart/form-data; boundary=abc"),
+                RestOperation::CreateCall,
+                Transport::WebRtcCall,
+                SessionKind::Opaque,
+                false,
+            ),
+            (
+                "/v1/realtime/calls/rtc_a/accept",
+                None,
+                RestOperation::AcceptCall {
+                    call_id: "rtc_a".into(),
+                },
+                Transport::Http,
+                SessionKind::Realtime,
+                false,
+            ),
+            (
+                "/v1/realtime/calls/rtc_a/reject",
+                None,
+                RestOperation::RejectCall {
+                    call_id: "rtc_a".into(),
+                },
+                Transport::Http,
+                SessionKind::Opaque,
+                false,
+            ),
+            (
+                "/v1/realtime/calls/rtc_a/refer",
+                None,
+                RestOperation::ReferCall {
+                    call_id: "rtc_a".into(),
+                },
+                Transport::Http,
+                SessionKind::Opaque,
+                false,
+            ),
+            (
+                "/v1/realtime/calls/rtc_a/hangup",
+                None,
+                RestOperation::HangupCall {
+                    call_id: "rtc_a".into(),
+                },
+                Transport::Http,
+                SessionKind::Opaque,
+                false,
+            ),
+            (
+                "/v1/realtime/client_secrets",
+                None,
+                RestOperation::CreateClientSecret,
+                Transport::Http,
+                SessionKind::Realtime,
+                false,
+            ),
+            (
+                "/v1/realtime/sessions",
+                None,
+                RestOperation::CreateLegacySession,
+                Transport::Http,
+                SessionKind::Realtime,
+                false,
+            ),
             (
                 "/v1/realtime/transcription_sessions",
+                None,
+                RestOperation::CreateTranscriptionSession,
+                Transport::Http,
                 SessionKind::Transcription,
+                false,
             ),
             (
                 "/v1/realtime/translations/client_secrets",
+                None,
+                RestOperation::CreateTranslationClientSecret,
+                Transport::Http,
                 SessionKind::Translation,
+                false,
             ),
-            ("/v1/realtime/calls/rtc_a/accept", SessionKind::Realtime),
-            ("/v1/realtime/calls/rtc_a/reject", SessionKind::Opaque),
-            ("/v1/realtime/calls/rtc_a/refer", SessionKind::Opaque),
-            ("/v1/realtime/calls/rtc_a/hangup", SessionKind::Opaque),
+            (
+                "/v1/realtime/translations/calls",
+                Some("application/sdp"),
+                RestOperation::CreateTranslationCall,
+                Transport::Http,
+                SessionKind::Translation,
+                true,
+            ),
         ];
 
-        for (path, kind) in rows {
+        for (path, content_type, operation, transport, kind, ephemeral) in rows {
             for mode in [
                 UpstreamCredentialMode::Managed,
                 UpstreamCredentialMode::Client,
             ] {
-                let selected = classify(&facts(
+                let facts = facts(
                     &Method::POST,
                     path,
                     &empty,
-                    None,
+                    content_type,
                     Some("future=v9"),
                     mode,
-                ))
-                .unwrap();
+                );
+                let classified = classify_rest(&facts).unwrap();
+                let selected = classified.selection;
+                assert_eq!(classified.operation, operation, "path={path}");
                 assert_eq!(selected.dialect, ApiDialect::OfficialGa, "path={path}");
-                assert_eq!(selected.transport, Transport::Http, "path={path}");
+                assert_eq!(selected.transport, transport, "path={path}");
                 assert_eq!(selected.session_kind, kind, "path={path}");
                 assert_eq!(
                     selected.credential,
-                    configured_credential(mode),
+                    if ephemeral {
+                        CredentialPolicy::Ephemeral
+                    } else {
+                        configured_credential(mode)
+                    },
                     "path={path} mode={mode:?}"
                 );
+                assert_eq!(classify(&facts), Ok(selected), "path={path}");
             }
         }
 
-        for mode in [
-            UpstreamCredentialMode::Managed,
-            UpstreamCredentialMode::Client,
-        ] {
-            assert_eq!(
-                classify(&facts(
-                    &Method::POST,
-                    "/v1/realtime/translations/calls",
-                    &empty,
-                    Some("application/sdp"),
-                    Some("future=v9"),
-                    mode,
-                )),
-                Ok(selection(
-                    ApiDialect::OfficialGa,
-                    Transport::Http,
-                    SessionKind::Translation,
-                    CredentialPolicy::Ephemeral,
-                ))
-            );
-        }
         assert_eq!(
-            classify(&facts(
+            classify_rest(&facts(
                 &Method::POST,
                 "/v1/realtime/translations/calls",
                 &empty,
@@ -794,7 +904,7 @@ mod tests {
                 None,
                 UpstreamCredentialMode::Client,
             )),
-            Err(ContractError::UnsupportedContentType)
+            Err(RestContractError::UnsupportedContentType)
         );
     }
 
@@ -897,5 +1007,110 @@ mod tests {
             )),
             Err(ContractError::UnknownRoute)
         );
+    }
+
+    #[test]
+    fn rest_error_taxonomy_and_broader_conversion_are_exhaustive() {
+        let empty = [];
+        let rows = [
+            (
+                facts(
+                    &Method::POST,
+                    "/v1/realtime/not-real",
+                    &empty,
+                    None,
+                    None,
+                    UpstreamCredentialMode::Managed,
+                ),
+                RestContractError::UnknownRoute,
+            ),
+            (
+                facts(
+                    &Method::GET,
+                    "/v1/realtime/client_secrets",
+                    &empty,
+                    None,
+                    None,
+                    UpstreamCredentialMode::Managed,
+                ),
+                RestContractError::MethodNotAllowed,
+            ),
+            (
+                facts(
+                    &Method::POST,
+                    "/v1/realtime/calls/has%2Fslash/accept",
+                    &empty,
+                    None,
+                    None,
+                    UpstreamCredentialMode::Managed,
+                ),
+                RestContractError::InvalidCallId,
+            ),
+            (
+                facts(
+                    &Method::POST,
+                    "/v1/realtime/calls",
+                    &empty,
+                    Some("application/json"),
+                    None,
+                    UpstreamCredentialMode::Managed,
+                ),
+                RestContractError::UnsupportedContentType,
+            ),
+            (
+                facts(
+                    &Method::POST,
+                    "/v1/realtime/calls",
+                    &empty,
+                    Some("multipart/form-data; boundary=x"),
+                    Some("quicksilver=v1"),
+                    UpstreamCredentialMode::Client,
+                ),
+                RestContractError::PrivateDialectRequiresManaged,
+            ),
+            (
+                facts(
+                    &Method::POST,
+                    "/v1/realtime/client_secrets",
+                    &empty,
+                    None,
+                    Some("quicksilver=v1"),
+                    UpstreamCredentialMode::Managed,
+                ),
+                RestContractError::PrivateDialectNotSupported,
+            ),
+        ];
+
+        for (facts, expected) in rows {
+            assert_eq!(classify_rest(&facts), Err(expected));
+            assert_eq!(classify(&facts), Err(ContractError::from(expected)));
+        }
+
+        let conversions = [
+            (RestContractError::UnknownRoute, ContractError::UnknownRoute),
+            (
+                RestContractError::MethodNotAllowed,
+                ContractError::MethodNotAllowed,
+            ),
+            (
+                RestContractError::InvalidCallId,
+                ContractError::InvalidCallId,
+            ),
+            (
+                RestContractError::UnsupportedContentType,
+                ContractError::UnsupportedContentType,
+            ),
+            (
+                RestContractError::PrivateDialectRequiresManaged,
+                ContractError::PrivateDialectRequiresManaged,
+            ),
+            (
+                RestContractError::PrivateDialectNotSupported,
+                ContractError::PrivateDialectNotSupported,
+            ),
+        ];
+        for (rest, broader) in conversions {
+            assert_eq!(ContractError::from(rest), broader);
+        }
     }
 }

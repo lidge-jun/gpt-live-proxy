@@ -400,9 +400,11 @@ async fn call_create_logs_carry_the_contract_fields_and_no_secrets() {
             .replace("ws://", "http://");
 
         // Rejected during the body read, before any upstream contact, so the
-        // span must already carry the host.
+        // legacy Live span must already carry the host. The official
+        // `/v1/realtime/calls` route now validates its media type before body
+        // read, so this observability contract belongs on `/v1/live`.
         let _ = reqwest::Client::new()
-            .post(format!("{proxy_http}/v1/realtime/calls"))
+            .post(format!("{proxy_http}/v1/live"))
             .header("content-type", "application/octet-stream")
             .header("authorization", "Bearer client-token-should-not-appear")
             .body(vec![b'x'; 32 * 1024 * 1024])
@@ -424,7 +426,7 @@ async fn call_create_logs_carry_the_contract_fields_and_no_secrets() {
     );
     for expected in [
         "method=POST",
-        "path=/v1/realtime/calls",
+        "path=/v1/live",
         "upstream=\"127.0.0.1:",
         "status=413",
         "elapsed_ms=",

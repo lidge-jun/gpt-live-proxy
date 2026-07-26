@@ -39,7 +39,8 @@ fixtures are separate.
 
 - enforce request-read, response, WS connect, WS send, and idle deadlines;
 - bound request concurrency, active WebSockets, pre-open bytes, and frame bytes;
-- return `429` plus `Retry-After` when local permits are exhausted;
+- soak and mutation-check WP2's HTTP `429`/`Retry-After` permit contract; add
+  the corresponding WS permit behavior without creating a second HTTP owner;
 - disable redirects and prove cross-host redirects never receive auth/body;
 - expose readiness separately from liveness if permit/drain state makes the
   service unable to accept work;

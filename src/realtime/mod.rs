@@ -5,3 +5,5 @@
 
 pub mod contract;
 pub mod headers;
+pub mod http;
+pub mod path;
