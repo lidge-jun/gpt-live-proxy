@@ -49,11 +49,11 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    // `/healthz` is the ONLY route outside the boundary: a supervisor must be able
-    // to probe liveness without a data-plane credential, and the reply carries no
-    // configuration or account information.
+    // Process probes stay outside the data-plane boundary. Neither response
+    // exposes configuration, account, credential, or capacity values.
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .merge(protected_routes(state.clone()))
         .fallback(any(protected_fallback))
         .with_state(state)
@@ -266,6 +266,23 @@ async fn healthz() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Readiness is intentionally stricter than liveness: a draining process or a
+/// process with either data-plane capacity pool fully occupied should receive
+/// no new traffic. The response does not expose counts or configuration.
+async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let ready = !state.drain.is_draining()
+        && state.active_requests.available_permits() > 0
+        && state.active_connections.available_permits() > 0;
+    if ready {
+        (StatusCode::OK, Json(json!({ "status": "ready" })))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "not_ready" })),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +389,82 @@ mod tests {
         assert_eq!(body["status"], "ok");
         assert_eq!(body["service"], "gpt-live-proxy");
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn readyz_is_unauthenticated_and_tracks_capacity_recovery() {
+        let state = remote_state("secret");
+        let app = router(state.clone());
+        let probe = || {
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        assert_eq!(
+            app.clone().oneshot(probe()).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let request_permits = state.active_requests.available_permits();
+        let held = state
+            .active_requests
+            .clone()
+            .acquire_many_owned(request_permits as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(probe()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(held);
+        assert_eq!(
+            app.clone().oneshot(probe()).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let connection_permits = state.active_connections.available_permits();
+        let held = state
+            .active_connections
+            .clone()
+            .acquire_many_owned(connection_permits as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(probe()).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(held);
+        assert_eq!(app.oneshot(probe()).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_draining_but_healthz_stays_live() {
+        let state = remote_state("secret");
+        state.drain.begin();
+        let app = router(state);
+        let ready = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let live = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(live.status(), StatusCode::OK);
     }
 
     #[tokio::test]

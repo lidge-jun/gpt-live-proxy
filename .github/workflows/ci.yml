@@ -5,33 +5,31 @@ on:
     branches: [main]
   pull_request:
 
-# Nothing is published, so the automatic GITHUB_TOKEN is scoped read-only. No
-# repository or user secrets are supplied to any step; `actions/checkout` uses
-# that automatic token, and `persist-credentials: false` below keeps it out of
-# .git/config where a build script or test could read it.
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  PROPTEST_CASES: "256"
+  PROPTEST_RNG_SEED: "20260726"
 
 jobs:
   check:
-    name: check (${{ matrix.os }})
+    name: rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
 
     steps:
-      # Every action is pinned to an immutable COMMIT sha, not a tag. A tag can
-      # be moved; a commit cannot. Verify a bump with
-      # `gh api repos/<owner>/<repo>/commits/<sha>`, which fails for a tag object.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Untrusted build scripts, proc macros, and tests run in this job on a
-          # fork PR; leaving the token in .git/config would expose it to them.
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable @ 2026-07-26
@@ -39,20 +37,25 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Verify locked dependency graph
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
       - name: Formatting
         run: cargo fmt --all -- --check
 
       - name: Lints
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
-  # Keep the toolchain below in step with `rust-version` in Cargo.toml.
   msrv:
     name: msrv (1.86)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,8 +67,101 @@ jobs:
           toolchain: "1.86"
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Declared MSRV builds
-        # The `check` job installs floating stable, so only this job can catch a
-        # dependency quietly raising the floor.
-        run: cargo check --all-targets --all-features
+        run: cargo check --locked --all-targets --all-features
+
+  conformance:
+    name: official conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable @ 2026-07-26
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.23.1"
+
+      - name: Install exact Node dependencies without lifecycle scripts
+        run: npm ci --prefix conformance/node --ignore-scripts --no-audit --no-fund
+
+      - name: Verify exact SDK packages
+        run: npm ls --prefix conformance/node openai ws --depth=0
+
+      - name: Build locked proxy binary
+        run: cargo build --locked --bin gpt-live-proxy
+
+      - name: Verify official fixture provenance
+        run: node scripts/verify-official-fixtures.mjs
+
+      - name: Run SDK and documented-transport conformance
+        run: npm test --prefix conformance/node
+
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable @ 2026-07-26
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.23.1"
+
+      - name: Install pinned security tools
+        run: ci/install-tools.sh
+
+      - name: Validate workflow syntax
+        run: actionlint
+
+      - name: Scan complete Git history for secrets
+        run: gitleaks git . --no-banner --redact
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Install exact Node dependencies without lifecycle scripts
+        run: npm ci --prefix conformance/node --ignore-scripts --no-audit --no-fund
+
+      - name: Audit Node dependencies
+        run: npm audit --prefix conformance/node --audit-level=high --ignore-scripts
+
+  mutation:
+    name: deterministic mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable @ 2026-07-26
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.23.1"
+
+      - name: Run fixed mutation gate
+        run: node scripts/mutation-check.mjs

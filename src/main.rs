@@ -1,5 +1,6 @@
 //! Binary entry point: read config from the environment, serve, shut down gracefully.
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use gpt_live_proxy::app::{router, AppState};
@@ -37,6 +38,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    if should_warn_single_principal(bind) {
+        tracing::warn!(
+            security_model = "single_principal",
+            tenant_isolation = false,
+            "non-loopback listener has no per-call tenant isolation; admission auth is access control only"
+        );
+    }
+
     tracing::info!(%bind, admission_auth = requires_auth, "gpt-live-proxy listening");
 
     // The drain flag is set the moment a signal arrives, so requests that land
@@ -64,6 +73,10 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn should_warn_single_principal(bind: SocketAddr) -> bool {
+    !bind.ip().is_loopback()
 }
 
 async fn shutdown_signal() {
@@ -95,4 +108,26 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received; draining");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_warn_single_principal;
+
+    #[test]
+    fn only_non_loopback_binds_emit_the_single_principal_warning() {
+        assert!(!should_warn_single_principal(
+            "127.0.0.1:10110".parse().unwrap()
+        ));
+        assert!(!should_warn_single_principal(
+            "[::1]:10110".parse().unwrap()
+        ));
+        assert!(should_warn_single_principal(
+            "0.0.0.0:10110".parse().unwrap()
+        ));
+        assert!(should_warn_single_principal("[::]:10110".parse().unwrap()));
+        assert!(should_warn_single_principal(
+            "192.0.2.10:10110".parse().unwrap()
+        ));
+    }
 }

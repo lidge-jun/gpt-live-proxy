@@ -1,110 +1,163 @@
-# 140 — Conformance, resource, privacy, and documentation hardening
+# 140 — Conformance, resource, privacy, and CI hardening
 
-Work-phase: `wp6-hardening`. Depends on all behavior phases.
+Work-phase: `wp6-hardening`. Depends on `100` through `130`.
 
-## Official-client conformance
+## Two conformance lanes
 
-### NEW `conformance/node/package.json`
+The npm registry was checked on 2026-07-26: `openai@6.49.0` is current and its
+integrity is pinned in the lockfile. `ws@8.21.1` satisfies the SDK's `^8.18.0`
+peer range and is pinned exactly by this project. Node is `22.23.1` with bundled
+npm `10.9.8`.
 
-Pin `openai` to the registry-proven exact version `6.49.0`; no ranges. Scripts
-start the Rust proxy and hermetic mock upstream on ephemeral ports and exercise
-the official SDK with only base URL/API key configuration plus the documented
-Realtime helpers available in that version. The lockfile is reviewed and no
-install script is permitted without explicit justification.
+### Official SDK lane
 
-### NEW `conformance/node/realtime.mjs`
+NEW `conformance/node/` uses the real package with only API key and `baseURL`
+configuration:
 
-Black-box scenarios:
+- `client.realtime.clientSecrets.create()`;
+- `client.realtime.calls.accept/reject/refer/hangup()`;
+- `OpenAIRealtimeWS` standalone `{ model }` and existing-call `{ callID }`;
+- `OpenAIRealtimeWebSocket` browser-style `realtime` + ephemeral subprotocol;
+- typed and generic `event` listeners for session, audio, response, tool, error,
+  and unknown events.
 
-- REST client-secret/session operations and upstream error mapping;
-- multipart and raw-SDP call creation;
-- standalone WebSocket, existing-call sideband, and translation WebSocket;
-- standard and browser subprotocol authentication;
-- `session.update`, audio append, response, tool, error, and unknown-event
-  transcripts.
+These are the helpers actually shipped in 6.49.0. The test does not claim SDK
+coverage for APIs that package does not expose.
 
-The mock captures exact wire artifacts; the harness never contacts OpenAI and
-never prints credentials.
+### Official documented-transport lane
 
-### MODIFY/VERIFY `tests/fixtures/official/`
+Raw `fetch`/`ws` scenarios follow the official guides for:
 
-Versioned fixture manifest records official source URL, fetch date, schema/event
-name, and SHA-256. `110` already owns the standard and translation WebSocket
-event-name inventory; this phase verifies its provenance and adds remaining
-HTTP/schema fixtures. Fixtures are not generated from Rust enums.
+- multipart and raw-SDP call-create;
+- translation client-secret/call/WebSocket;
+- optional browser organization/project protocols;
+- returned `Location` → call ID → SDK sideband composition.
 
-## Resource and egress hardening
+This proves documented wire/base-URL compatibility, not browser media-plane or
+`RTCPeerConnection` behavior.
 
-### MODIFY `src/config.rs`, `src/app.rs`, relay modules
+`runner.mjs` starts a mock upstream and the Rust proxy on ephemeral loopback
+ports, waits on readiness, runs both lanes, and always terminates children. An
+egress guard rejects non-loopback Node connections; every proxy upstream base is
+also asserted loopback. Captures expose method, path, header names, byte length,
+and SHA-256 only—never credentials or body/frame bytes.
 
-- enforce request-read, response, WS connect, WS send, and idle deadlines;
-- bound request concurrency, active WebSockets, pre-open bytes, and frame bytes;
-- soak and mutation-check WP2's HTTP and WP3's WebSocket
-  `429`/`Retry-After` permit contracts without creating second owners;
-- disable redirects and prove cross-host redirects never receive auth/body;
-- expose readiness separately from liveness if permit/drain state makes the
-  service unable to accept work;
-- document single-principal-only network operation unless call-ID ownership is
-  implemented in this phase.
+Install and verify with:
 
-Call ownership decision: remain explicitly single-principal in version 0.1.x.
-Multi-principal call-ID binding requires an identity store and is outside this
-proxy's stateless architecture. A network bind therefore requires one shared
-principal and says so at startup/README; it must not claim tenant isolation.
+```bash
+npm ci --prefix conformance/node --ignore-scripts --no-audit --no-fund
+npm ls --prefix conformance/node openai ws --depth=0
+cargo build --locked --bin gpt-live-proxy
+npm test --prefix conformance/node
+```
 
-## Privacy
+## Fixture provenance
 
-### VERIFY `src/observability/frame_log.rs`, `src/observability/mod.rs`, `docs/050_observability.md`
+NEW `tests/fixtures/official/manifest.json` and
+`scripts/verify-official-fixtures.mjs` record and verify, per fixture:
 
-`110` already removes payload excerpts and hard-disables every
-tungstenite/tokio-tungstenite dependency target that can render handshake or
-frame payloads. Verify that metadata-only record and filter under
-adversarial EnvFilter directives; do not reintroduce excerpts or a reversible
-digest. Canary tests cover headers, HTTP bodies, text/binary frames, close
-reasons, and subprotocols. No test artifact may contain the canary.
+- exact SDK package/version plus official source URLs and retrieval date;
+- operation/event inventory and JSON Pointer where applicable;
+- a separate reviewed canonical source-extraction file with its SHA-256, plus
+  the checked-in JSON fixture SHA-256 as a distinct field;
+- SDK version, npm integrity, and shasum.
+
+Fixtures are reviewed source snapshots, never generated from Rust enums. The
+offline verifier proves their internal provenance and byte stability and fails
+on a hash, count, duplicate, source-extraction/fixture, or manifest mismatch.
+Refreshing a source snapshot still requires re-extracting and reviewing the
+listed official pages.
+
+## Resource behavior
+
+Existing owners already enforce request-read/upstream-response, WebSocket
+connect/send deadlines; request/response/frame/pre-open byte caps; request and
+connection semaphores; redirect refusal; cancellation cleanup; and exact
+`429`/`Retry-After: 1`. WP6 mutation- and soak-activates them rather than adding
+second implementations.
+
+### Opt-in idle policy
+
+The source contract disables WebSocket idle timeout (`0`), and default official
+compatibility must remain unchanged. Add `GPT_LIVE_WS_IDLE_TIMEOUT_MS`, default
+`0`. A nonzero operator value starts only after upstream connection, is reset by
+any received data or control frame on either leg, and closes both legs with
+`1001 / idle timeout`. Public and private pumps share one timer implementation;
+tests prove socket/permit recovery. No default 300-second cutoff is introduced.
+
+### Readiness and deployment model
+
+`/healthz` remains unauthenticated process liveness. NEW `/readyz` is also
+credential-free and returns 503 while draining or while either request or
+connection capacity is fully exhausted, then returns 200 after recovery. It
+contains no config, account, or credential data.
+
+Non-loopback startup emits one structured warning:
+`security_model=single_principal tenant_isolation=false`. Admission auth is
+access control, not call-ID ownership. Version 0.1.x does not claim safe
+multi-tenant isolation; loopback startup emits no warning.
 
 ## Test strength
 
-- property tests: URL/query normalization, call IDs, header casing/duplicates,
-  multipart boundaries, limit arithmetic;
-- mutation checks: route variants, credential policy, header allowlists, AVAS
-  truth table, cap comparisons, pump outcomes, capability matrix;
-- deterministic fault peers: upstream/client reset during read/send and stalled
-  handshake/sinks;
-- literal 16 MiB and +1 HTTP boundary;
-- bounded load/soak: permits and task counts return to baseline.
+- fixed-seed `proptest 1.9.0` with `PROPTEST_CASES=256` and
+  `PROPTEST_RNG_SEED=20260726` for URL/query normalization, call IDs,
+  header casing/duplicates, multipart boundaries, and checked cap arithmetic;
+- real-socket exact 16 MiB and 16 MiB+1 request/response boundaries;
+- 64-round barrier-driven HTTP/public-WS/private-WS permit soak with baseline
+  task/socket/permit recovery after every round;
+- deterministic upstream/client reset and send-failure pump outcomes;
+- hostile EnvFilter and metadata-only frame-log tests retained unchanged;
+- NEW `scripts/mutation-check.mjs` copies the tree to a temporary directory,
+  applies seven fixed one-token mutants (route, capability support, credential
+  policy, header allowlist, AVAS, cap comparison, pump outcome), and requires
+  the owner-focused tests to fail for each.
 
-No skip, retry-as-fix, threshold reduction, assertion deletion, or fixture
-generated from the implementation can satisfy this phase.
+The checked-in deterministic mutation runner is the CI authority; no floating
+mutation tool or threshold is used. A missing source anchor, surviving mutant,
+timeout, skipped test, or deleted assertion fails.
 
-## CI changes
+## CI
 
-Modify `.github/workflows/ci.yml` with immutable action commit SHAs only:
+MODIFY `.github/workflows/ci.yml`:
 
-1. existing Rust Linux/macOS and MSRV jobs;
-2. hermetic Node SDK conformance;
-3. dependency and secret scan using repository-approved pinned tools;
-4. selective mutation job where runtime cost is acceptable, otherwise a
-   checked-in mutation script executed in the main test job;
-5. failure artifacts containing metadata only.
+- all actions remain immutable commit SHAs; `actions/setup-node` is pinned to
+  `820762786026740c76f36085b0efc47a31fe5020`;
+- add workflow concurrency cancellation and job timeouts;
+- Rust Linux/macOS and MSRV 1.86 commands use `--locked`;
+- Node conformance uses pinned `actions/setup-node` SHA, Node `22.23.1`, lockfile,
+  `npm ci --ignore-scripts`, fixture verification, and loopback egress guard;
+- Ubuntu security installs
+  `https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz`
+  at SHA-256 `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`
+  and
+  `https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz`
+  at SHA-256 `551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb`.
+  It installs `cargo-audit 0.22.2 --locked` from the crates.io archive whose
+  SHA-256 is `700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a`,
+  then runs full-history gitleaks, cargo audit, and
+  `npm audit --audit-level=high`;
+- deterministic mutation script runs in its own bounded Ubuntu job;
+- no raw logs, wire captures, headers, bodies, frame logs, or environment files
+  are uploaded as artifacts. Therefore no upload action is required.
 
-Run `actionlint` and verify every new action SHA resolves to a commit, not an
-annotated tag object.
+Keep `permissions: contents: read` and `persist-credentials: false`. Cache writes
+are limited to trusted main pushes.
 
-## Documentation sync
+## Documentation and verification
 
-Update README route/profile matrices, configuration, official Node/WebSocket/
-WebRTC examples, security model, compatibility limits, and verification counts.
-Update `002`, `050`, and `060` so no authority retains the old relay-only claim.
-
-## Verification
+Update README and `docs/{002,050,060}` with readiness, opt-in idle, exact SDK vs
+documented-transport claims, single-principal security, and executable commands.
+Ignore only `/.codexclaw/` tool state; do not hide source or release files.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-npm ci --prefix conformance/node
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo +1.86 check --locked --all-targets --all-features
+npm ci --prefix conformance/node --ignore-scripts --no-audit --no-fund
 npm test --prefix conformance/node
+node scripts/verify-official-fixtures.mjs
+node scripts/mutation-check.mjs
 actionlint
-gitleaks detect --source . --no-banner --redact
+gitleaks git . --no-banner --redact
 ```

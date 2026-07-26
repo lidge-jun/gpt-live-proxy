@@ -131,3 +131,59 @@ defines the exact local record boundary.
 ## D6. Environment variable naming
 
 OpenCodex uses `OCX_LIVE_FRAME_LOG`. The standalone service uses `GPT_LIVE_FRAME_LOG`, with `OCX_LIVE_FRAME_LOG` accepted as a compatibility alias so an existing diagnostic workflow keeps working.
+
+## D7. Compatibility has two separately named evidence lanes
+
+The pinned `openai@6.49.0` package is the authority for the `official-sdk`
+lane. That lane uses only helpers the package actually ships: Realtime client
+secret and call-control REST resources, `OpenAIRealtimeWS` standalone and
+existing-call connections, and `OpenAIRealtimeWebSocket` browser-style
+subprotocol authentication. The proxy address is supplied through `baseURL`;
+the harness does not patch SDK code.
+
+Multipart/raw-SDP WebRTC signaling, translation, optional organization/project
+browser protocols, and `Location` to sideband composition have no matching SDK
+helper in that version. They belong to `official-doc-transport`, which uses the
+wire shapes from the official guides through raw `fetch` and `ws`. Passing that
+lane proves HTTP/WebSocket signaling compatibility, not a browser
+`RTCPeerConnection` media plane. Fixtures record official source URLs and a
+retrieval date, then pin both a canonical inventory serialization and the
+checked-in JSON bytes by SHA-256. The canonical serialization is a separate
+reviewed source-extraction file, not reconstructed from the JSON fixture. The
+verifier proves that the reviewed snapshot has not drifted inside the
+repository; refreshing it against the
+official pages remains an explicit review operation, not a networked CI step.
+
+## D8. Availability and tenancy are operator-visible contracts
+
+`/healthz` answers process liveness and remains 200 while the process can serve
+HTTP. `/readyz` is a separate, credential-free readiness signal: draining or
+complete exhaustion of either request or connection permits returns 503, and
+capacity recovery returns it to 200. Neither response contains configuration,
+credential, account, call, or capacity values.
+
+There is no proxy-enforced call-ID ownership or tenant namespace. Admission
+authentication is access control only. The deployment model is therefore
+`security_model=single_principal tenant_isolation=false`, logged once at WARN on
+a non-loopback bind. Loopback startup omits the warning. Operators must run
+separate instances for mutually untrusted principals.
+
+Official compatibility also means the proxy must not invent a default idle
+cutoff. `GPT_LIVE_WS_IDLE_TIMEOUT_MS` defaults to `0` (disabled). A nonzero
+operator value begins only after upstream connection, resets on every received
+data or control frame on either leg, and closes both legs with `1001 / idle
+timeout` when it expires.
+
+## D9. CI is reproducible and produces no raw diagnostic artifacts
+
+The workflow uses immutable action SHAs, exact Node `22.23.1`, npm lockfiles,
+Cargo `--locked`, a separate Rust 1.86 lane, and trusted-main-only cache writes.
+Security tools are downloaded from exact release URLs and accepted only after
+their hard-coded SHA-256 succeeds; `cargo-audit 0.22.2` is built from the
+verified crates.io archive with its lockfile.
+
+The security job checks workflow syntax, scans the complete Git history with
+gitleaks, and audits both Rust and Node dependencies. The deterministic mutation
+job covers route, capability, credential, response-header, AVAS, cap, and pump
+outcome anchors. No job uploads stdout, wire captures, headers, bodies, frame
+logs, or environment files.

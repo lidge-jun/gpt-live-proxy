@@ -280,6 +280,7 @@ pub async fn handle_sideband(
     let policy = PumpPolicy {
         frame_bytes: cap,
         send_timeout: state.config.limits.websocket_send_timeout,
+        idle_timeout: state.config.limits.websocket_idle_timeout,
         close_policy: ClosePolicy::PrivateNormalized,
     };
     let connect_timeout = state.config.limits.websocket_connect_timeout;

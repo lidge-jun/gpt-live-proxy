@@ -235,6 +235,7 @@ fn pump_policy(state: &AppState, close_policy: ClosePolicy) -> PumpPolicy {
     PumpPolicy {
         frame_bytes: state.config.limits.websocket_frame_bytes,
         send_timeout: state.config.limits.websocket_send_timeout,
+        idle_timeout: state.config.limits.websocket_idle_timeout,
         close_policy,
     }
 }

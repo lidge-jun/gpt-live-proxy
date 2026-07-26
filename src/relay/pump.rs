@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::Error as TungError;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::config::{MAX_WEBSOCKET_FRAME_BYTES, WEBSOCKET_SEND_TIMEOUT};
+use crate::config::{MAX_WEBSOCKET_FRAME_BYTES, WEBSOCKET_IDLE_TIMEOUT, WEBSOCKET_SEND_TIMEOUT};
 use crate::observability::{Direction, FrameLogger};
 use crate::relay::ws_convert::{axum_to_tungstenite, close_parts, tungstenite_to_axum};
 
@@ -37,12 +37,14 @@ pub const CLOSE_CLIENT_SEND_FAILED: &str = "client send failed";
 pub const CLOSE_UPSTREAM_SEND_TIMED_OUT: &str = "upstream send timed out";
 pub const CLOSE_DOWNSTREAM_SEND_TIMED_OUT: &str = "downstream send timed out";
 pub const CLOSE_CLIENT_CLOSED: &str = "client closed";
+pub const CLOSE_IDLE_TIMEOUT: &str = "idle timeout";
 /// Retained for parity with the source state machine; this pump cannot reach it.
 pub const CLOSE_MISSING_UPSTREAM: &str = "missing upstream";
 
 pub const CODE_POLICY: u16 = 1009;
 pub const CODE_INTERNAL: u16 = 1011;
 pub const CODE_NORMAL: u16 = 1000;
+pub const CODE_GOING_AWAY: u16 = 1001;
 
 /// How long the final closing handshake may retain a relay task.
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,6 +61,7 @@ pub enum ClosePolicy {
 pub struct PumpPolicy {
     pub frame_bytes: usize,
     pub send_timeout: Duration,
+    pub idle_timeout: Duration,
     pub close_policy: ClosePolicy,
 }
 
@@ -67,6 +70,7 @@ impl PumpPolicy {
         Self {
             frame_bytes: MAX_WEBSOCKET_FRAME_BYTES,
             send_timeout: WEBSOCKET_SEND_TIMEOUT,
+            idle_timeout: WEBSOCKET_IDLE_TIMEOUT,
             close_policy: ClosePolicy::PrivateNormalized,
         }
     }
@@ -385,9 +389,28 @@ where
         }
     };
 
+    let idle_deadline = idle_deadline(&policy);
     while let Some(message) = queue.pop_front() {
         log_frame(&logger, Direction::ClientToUpstream, &message);
-        match bounded_send(&mut upstream, message, policy.send_timeout).await {
+        let send_result = if let Some(deadline) = idle_deadline {
+            tokio::select! {
+                result = bounded_send(&mut upstream, message, policy.send_timeout) => Some(result),
+                _ = tokio::time::sleep_until(deadline) => None,
+            }
+        } else {
+            Some(bounded_send(&mut upstream, message, policy.send_timeout).await)
+        };
+        let Some(send_result) = send_result else {
+            return abort_both(
+                &mut downstream,
+                &mut upstream,
+                CODE_GOING_AWAY,
+                CLOSE_IDLE_TIMEOUT,
+                policy.send_timeout,
+            )
+            .await;
+        };
+        match send_result {
             Ok(()) => {}
             Err(SendFailure::Failed) => {
                 tell_downstream(
@@ -415,14 +438,14 @@ where
         }
     }
 
-    run_connected(downstream, upstream, policy, logger).await
+    run_connected_from_deadline(downstream, upstream, policy, logger, idle_deadline).await
 }
 
 /// Production-used connected relay loop. Keeping both transports generic gives
 /// unit tests a deterministic pending writer without relying on kernel buffers.
 async fn run_connected<D, U, DE, UE>(
-    mut downstream: D,
-    mut upstream: U,
+    downstream: D,
+    upstream: U,
     policy: PumpPolicy,
     logger: FrameLogger,
 ) -> PumpOutcome
@@ -432,8 +455,46 @@ where
     DE: FrameReadFailure,
     UE: FrameReadFailure,
 {
+    let deadline = idle_deadline(&policy);
+    run_connected_from_deadline(downstream, upstream, policy, logger, deadline).await
+}
+
+fn idle_deadline(policy: &PumpPolicy) -> Option<tokio::time::Instant> {
+    (!policy.idle_timeout.is_zero()).then(|| tokio::time::Instant::now() + policy.idle_timeout)
+}
+
+async fn run_connected_from_deadline<D, U, DE, UE>(
+    mut downstream: D,
+    mut upstream: U,
+    policy: PumpPolicy,
+    logger: FrameLogger,
+    mut idle_deadline: Option<tokio::time::Instant>,
+) -> PumpOutcome
+where
+    D: Sink<AxumMessage> + Stream<Item = Result<AxumMessage, DE>> + Unpin,
+    U: Sink<TungMessage> + Stream<Item = Result<TungMessage, UE>> + Unpin,
+    DE: FrameReadFailure,
+    UE: FrameReadFailure,
+{
     loop {
+        let deadline_for_wait = idle_deadline;
+        let idle = async move {
+            match deadline_for_wait {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(idle);
         tokio::select! {
+            _ = &mut idle => {
+                return abort_both(
+                    &mut downstream,
+                    &mut upstream,
+                    CODE_GOING_AWAY,
+                    CLOSE_IDLE_TIMEOUT,
+                    policy.send_timeout,
+                ).await;
+            }
             inbound = downstream.next() => match inbound {
                 Some(Ok(AxumMessage::Close(frame))) => {
                     match policy.close_policy {
@@ -474,6 +535,9 @@ where
                     return PumpOutcome::ClientClosed;
                 }
                 Some(Ok(message)) => {
+                    idle_deadline = idle_deadline.map(|_| {
+                        tokio::time::Instant::now() + policy.idle_timeout
+                    });
                     let bytes = message_bytes_axum(&message);
                     if bytes > policy.frame_bytes {
                         return abort_both(
@@ -521,6 +585,9 @@ where
                     return PumpOutcome::UpstreamClosed { code, reason };
                 }
                 Some(Ok(message)) => {
+                    idle_deadline = idle_deadline.map(|_| {
+                        tokio::time::Instant::now() + policy.idle_timeout
+                    });
                     let bytes = message_bytes_tungstenite(&message);
                     if bytes > policy.frame_bytes {
                         return abort_both(
@@ -599,6 +666,8 @@ mod tests {
         inbound: VecDeque<Result<I, ()>>,
         sent: Arc<Mutex<Vec<O>>>,
         pending_write: bool,
+        fail_write: bool,
+        signal_read: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
     impl<I, O> ScriptedSocket<I, O> {
@@ -609,6 +678,8 @@ mod tests {
                     inbound: inbound.into_iter().collect(),
                     sent: sent.clone(),
                     pending_write: false,
+                    fail_write: false,
+                    signal_read: None,
                 },
                 sent,
             )
@@ -619,12 +690,27 @@ mod tests {
             socket.pending_write = true;
             (socket, sent)
         }
+
+        fn failed(inbound: impl IntoIterator<Item = Result<I, ()>>) -> (Self, Arc<Mutex<Vec<O>>>) {
+            let (mut socket, sent) = Self::new(inbound);
+            socket.fail_write = true;
+            (socket, sent)
+        }
+
+        fn signal_first_read(&mut self, signal: tokio::sync::oneshot::Sender<()>) {
+            self.signal_read = Some(signal);
+        }
     }
 
     impl<I: Unpin, O: Unpin> Stream for ScriptedSocket<I, O> {
         type Item = Result<I, ()>;
 
         fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if !self.inbound.is_empty() {
+                if let Some(signal) = self.signal_read.take() {
+                    let _ = signal.send(());
+                }
+            }
             match self.inbound.pop_front() {
                 Some(item) => Poll::Ready(Some(item)),
                 None => Poll::Pending,
@@ -636,7 +722,9 @@ mod tests {
         type Error = ();
 
         fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            if self.pending_write {
+            if self.fail_write {
+                Poll::Ready(Err(()))
+            } else if self.pending_write {
                 Poll::Pending
             } else {
                 Poll::Ready(Ok(()))
@@ -661,6 +749,7 @@ mod tests {
         PumpPolicy {
             frame_bytes,
             send_timeout: Duration::from_millis(1),
+            idle_timeout: Duration::ZERO,
             close_policy,
         }
     }
@@ -744,6 +833,156 @@ mod tests {
         assert_eq!(
             tung_close_parts(&upstream_sent.lock().unwrap()[0]),
             (1011, "downstream send timed out")
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_closes_both_legs_with_1001() {
+        let (downstream, downstream_sent) = ScriptedSocket::<AxumMessage, AxumMessage>::new([]);
+        let (upstream, upstream_sent) = ScriptedSocket::<TungMessage, TungMessage>::new([]);
+        let mut idle_policy = policy(8, ClosePolicy::Transparent);
+        idle_policy.idle_timeout = Duration::from_millis(5);
+
+        let outcome =
+            run_connected(downstream, upstream, idle_policy, FrameLogger::disabled()).await;
+
+        assert_eq!(
+            outcome,
+            PumpOutcome::Aborted {
+                code: CODE_GOING_AWAY,
+                reason: CLOSE_IDLE_TIMEOUT,
+            }
+        );
+        let down = downstream_sent.lock().unwrap();
+        let AxumMessage::Close(Some(frame)) = &down[0] else {
+            panic!("expected downstream close frame");
+        };
+        assert_eq!((frame.code, frame.reason.as_str()), (1001, "idle timeout"));
+        assert_eq!(
+            tung_close_parts(&upstream_sent.lock().unwrap()[0]),
+            (1001, "idle timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn private_idle_timeout_starts_when_upstream_connects_before_queue_flush() {
+        let (mut downstream, downstream_sent) =
+            ScriptedSocket::<AxumMessage, AxumMessage>::new([Ok(AxumMessage::Text(
+                "queued".into(),
+            ))]);
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        downstream.signal_first_read(read_tx);
+        let (upstream, _) = ScriptedSocket::<TungMessage, TungMessage>::pending([]);
+        let connect = async move {
+            let _ = read_rx.await;
+            Ok::<_, String>(upstream)
+        };
+        let mut idle_policy = policy(64, ClosePolicy::PrivateNormalized);
+        idle_policy.send_timeout = Duration::from_millis(20);
+        idle_policy.idle_timeout = Duration::from_millis(5);
+
+        let outcome =
+            run_private_with(downstream, connect, idle_policy, FrameLogger::disabled()).await;
+
+        assert_eq!(
+            outcome,
+            PumpOutcome::Aborted {
+                code: CODE_GOING_AWAY,
+                reason: CLOSE_IDLE_TIMEOUT,
+            }
+        );
+        let sent = downstream_sent.lock().unwrap();
+        let AxumMessage::Close(Some(frame)) = &sent[0] else {
+            panic!("expected downstream idle close");
+        };
+        assert_eq!((frame.code, frame.reason.as_str()), (1001, "idle timeout"));
+    }
+
+    #[tokio::test]
+    async fn upstream_read_reset_uses_fixed_upstream_error_outcome() {
+        let (downstream, downstream_sent) = ScriptedSocket::<AxumMessage, AxumMessage>::new([]);
+        let (upstream, _) = ScriptedSocket::<TungMessage, TungMessage>::new([Err(())]);
+
+        let outcome = run_connected(
+            downstream,
+            upstream,
+            policy(8, ClosePolicy::Transparent),
+            FrameLogger::disabled(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PumpOutcome::Aborted {
+                code: CODE_INTERNAL,
+                reason: CLOSE_UPSTREAM_ERROR,
+            }
+        );
+        let sent = downstream_sent.lock().unwrap();
+        let AxumMessage::Close(Some(frame)) = &sent[0] else {
+            panic!("expected downstream close frame");
+        };
+        assert_eq!(
+            (frame.code, frame.reason.as_str()),
+            (1011, "upstream error")
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_send_failure_uses_fixed_outcome() {
+        let (downstream, downstream_sent) =
+            ScriptedSocket::<AxumMessage, AxumMessage>::new([Ok(AxumMessage::Text("x".into()))]);
+        let (upstream, _) = ScriptedSocket::<TungMessage, TungMessage>::failed([]);
+
+        let outcome = run_connected(
+            downstream,
+            upstream,
+            policy(8, ClosePolicy::Transparent),
+            FrameLogger::disabled(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PumpOutcome::Aborted {
+                code: CODE_INTERNAL,
+                reason: CLOSE_UPSTREAM_SEND_FAILED,
+            }
+        );
+        let sent = downstream_sent.lock().unwrap();
+        let AxumMessage::Close(Some(frame)) = &sent[0] else {
+            panic!("expected downstream close frame");
+        };
+        assert_eq!(
+            (frame.code, frame.reason.as_str()),
+            (1011, "upstream send failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_send_failure_uses_fixed_outcome() {
+        let (downstream, _) = ScriptedSocket::<AxumMessage, AxumMessage>::failed([]);
+        let (upstream, upstream_sent) =
+            ScriptedSocket::<TungMessage, TungMessage>::new([Ok(TungMessage::Text("x".into()))]);
+
+        let outcome = run_connected(
+            downstream,
+            upstream,
+            policy(8, ClosePolicy::Transparent),
+            FrameLogger::disabled(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PumpOutcome::Aborted {
+                code: CODE_INTERNAL,
+                reason: CLOSE_CLIENT_SEND_FAILED,
+            }
+        );
+        assert_eq!(
+            tung_close_parts(&upstream_sent.lock().unwrap()[0]),
+            (1011, "client send failed")
         );
     }
 
@@ -897,5 +1136,7 @@ mod tests {
         assert_eq!(CLOSE_DOWNSTREAM_SEND_TIMED_OUT, "downstream send timed out");
         assert_eq!(CODE_POLICY, 1009);
         assert_eq!(CODE_INTERNAL, 1011);
+        assert_eq!(CODE_GOING_AWAY, 1001);
+        assert_eq!(CLOSE_IDLE_TIMEOUT, "idle timeout");
     }
 }

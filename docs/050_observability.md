@@ -29,6 +29,13 @@ Other tracing targets continue to obey the user filter. Tests emit canaries on
 the exact target and a child target while also proving an unrelated trace event
 survives.
 
+On a non-loopback bind the service emits one deployment warning containing only
+the fixed fields `security_model=single_principal` and
+`tenant_isolation=false`. It carries no bind credential, upstream credential,
+account, origin, call ID, URL, or request data. A loopback bind emits no such
+warning. The warning is about the absence of tenant isolation: admission auth
+does not establish call-ID ownership.
+
 Application spans record bounded operational metadata such as method, local
 path, upstream host, status, elapsed time, join style, and terminal outcome.
 They never record authorization values, account IDs, bearer tokens, SDP/session
@@ -43,6 +50,11 @@ Credential protection remains layered:
    known credential channels by name.
 4. All Tungstenite and Tokio-Tungstenite dependency targets are hard-disabled
    after the user filter is parsed.
+
+`/healthz` and `/readyz` are intentionally credential-free observability
+surfaces. They return liveness/readiness status only. Readiness becomes 503
+while draining or when request or connection capacity is exhausted and returns
+to 200 after recovery; no response includes configured limits or active counts.
 
 ## Frame-forensics record
 
@@ -101,3 +113,6 @@ inspection result never feeds back into the relayed frame.
 - No serialized record has `context`, payload, close-reason, or digest fields.
 - An unwritable path and a saturated writer cannot interrupt relay traffic.
 - Bearer `Debug`, header sensitivity, and `redacted_headers` remain covered.
+- Non-loopback startup emits only the fixed single-principal warning fields;
+  loopback startup emits none.
+- Health and readiness responses contain no configuration or principal data.

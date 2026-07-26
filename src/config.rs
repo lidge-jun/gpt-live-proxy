@@ -21,6 +21,8 @@ pub const MAX_ACTIVE_CONNECTIONS: usize = 128;
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+/// Connected WebSocket idle deadline. Zero disables the deadline by default.
+pub const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::ZERO;
 
 const DEFAULT_BIND: &str = "127.0.0.1:10110";
 const CHATGPT_BACKEND_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -84,6 +86,7 @@ pub struct Limits {
     pub upstream_timeout: Duration,
     pub websocket_connect_timeout: Duration,
     pub websocket_send_timeout: Duration,
+    pub websocket_idle_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -98,6 +101,7 @@ impl Default for Limits {
             upstream_timeout: UPSTREAM_TIMEOUT,
             websocket_connect_timeout: WEBSOCKET_CONNECT_TIMEOUT,
             websocket_send_timeout: WEBSOCKET_SEND_TIMEOUT,
+            websocket_idle_timeout: WEBSOCKET_IDLE_TIMEOUT,
         }
     }
 }
@@ -347,6 +351,21 @@ fn positive_millis(
     Ok(Duration::from_millis(value))
 }
 
+fn nonnegative_millis(
+    raw: Option<String>,
+    key: &'static str,
+    default: Duration,
+) -> Result<Duration, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw.parse::<u64>().map_err(|err| ConfigError::Invalid {
+        key,
+        reason: format!("expected a non-negative integer: {err}"),
+    })?;
+    Ok(Duration::from_millis(value))
+}
+
 impl Config {
     /// Build a config from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -490,6 +509,11 @@ impl Config {
                 get("GPT_LIVE_WS_SEND_TIMEOUT_MS"),
                 "GPT_LIVE_WS_SEND_TIMEOUT_MS",
                 WEBSOCKET_SEND_TIMEOUT,
+            )?,
+            websocket_idle_timeout: nonnegative_millis(
+                get("GPT_LIVE_WS_IDLE_TIMEOUT_MS"),
+                "GPT_LIVE_WS_IDLE_TIMEOUT_MS",
+                WEBSOCKET_IDLE_TIMEOUT,
             )?,
         };
 
@@ -888,6 +912,7 @@ mod tests {
                 upstream_timeout: Duration::from_secs(120),
                 websocket_connect_timeout: Duration::from_secs(15),
                 websocket_send_timeout: Duration::from_secs(15),
+                websocket_idle_timeout: Duration::ZERO,
             }
         );
     }
@@ -905,6 +930,7 @@ mod tests {
             ("GPT_LIVE_UPSTREAM_TIMEOUT_MS", "107"),
             ("GPT_LIVE_WS_CONNECT_TIMEOUT_MS", "108"),
             ("GPT_LIVE_WS_SEND_TIMEOUT_MS", "109"),
+            ("GPT_LIVE_WS_IDLE_TIMEOUT_MS", "110"),
         ]))
         .unwrap();
 
@@ -922,6 +948,10 @@ mod tests {
         assert_eq!(
             cfg.limits.websocket_send_timeout,
             Duration::from_millis(109)
+        );
+        assert_eq!(
+            cfg.limits.websocket_idle_timeout,
+            Duration::from_millis(110)
         );
     }
 
@@ -955,6 +985,34 @@ mod tests {
                     "{key}={bad} returned {err}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn websocket_idle_timeout_is_opt_in_and_zero_disables_it() {
+        let disabled = Config::from_source(source(&[
+            ("GPT_LIVE_TOKEN", "t"),
+            ("GPT_LIVE_WS_IDLE_TIMEOUT_MS", "0"),
+        ]))
+        .unwrap();
+        assert_eq!(disabled.limits.websocket_idle_timeout, Duration::ZERO);
+
+        for bad in [
+            "not-a-number",
+            "999999999999999999999999999999999999999999999999999999999999",
+        ] {
+            let err = Config::from_source(source(&[
+                ("GPT_LIVE_TOKEN", "t"),
+                ("GPT_LIVE_WS_IDLE_TIMEOUT_MS", bad),
+            ]))
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "GPT_LIVE_WS_IDLE_TIMEOUT_MS",
+                    ..
+                }
+            ));
         }
     }
 

@@ -1,4 +1,6 @@
 /target
+/.codexclaw/
+/conformance/node/node_modules/
 **/*.rs.bk
 .env
 .env.*

@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "retrieved_on": "2026-07-26",
+  "sdk": {
+    "package": "openai",
+    "version": "6.49.0",
+    "registry_metadata_url": "https://registry.npmjs.org/openai/6.49.0",
+    "tarball_url": "https://registry.npmjs.org/openai/-/openai-6.49.0.tgz",
+    "integrity": "sha512-aYCc0C6L864eR6WSYIwQGyXriw/nIyZx0ObvhzOEVuk0zoBDpynjSbrionWI7q65B5H8jJX0DXR9snEzM6bfPg==",
+    "shasum": "6e9f798e146935ed38d955b43d57d6796cee5e6b",
+    "file_count": 2701,
+    "unpacked_size": 12468421
+  },
+  "fixtures": [
+    {
+      "path": "tests/fixtures/official/realtime-events.json",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/reference/resources/realtime/client-events",
+          "json_pointer": "/standard_client"
+        },
+        {
+          "url": "https://developers.openai.com/api/reference/resources/realtime/server-events",
+          "json_pointer": "/standard_server"
+        },
+        {
+          "url": "https://developers.openai.com/api/docs/guides/realtime-translation",
+          "json_pointer": "/translation_client"
+        },
+        {
+          "url": "https://developers.openai.com/api/docs/guides/realtime-translation",
+          "json_pointer": "/translation_server"
+        }
+      ],
+      "canonical_source": {
+        "path": "tests/fixtures/official/sources/realtime-events-2026-07-26.txt",
+        "format": "UTF-8 blocks in inventory order: [name] LF, one event per LF, final LF",
+        "byte_length": 1888,
+        "sha256": "cbbed4f0397d5b407161025a2737be511b18c69c6e863f6e9d02076c2e78ff8c"
+      },
+      "checked_in_fixture_sha256": "1bedd0acfcdae068ae6871535809e1fc2af1b37ac28b3a88ab700f8183c829b5",
+      "inventories": [
+        {
+          "name": "standard_client",
+          "json_pointer": "/standard_client",
+          "count": 11,
+          "sha256": "7bd22c7b4f3b2c82f961f9b8fafcc0eb86bf252e591e01d12c1b306c8344291c",
+          "items": [
+            "session.update",
+            "input_audio_buffer.append",
+            "input_audio_buffer.commit",
+            "input_audio_buffer.clear",
+            "conversation.item.create",
+            "conversation.item.retrieve",
+            "conversation.item.truncate",
+            "conversation.item.delete",
+            "response.create",
+            "response.cancel",
+            "output_audio_buffer.clear"
+          ]
+        },
+        {
+          "name": "standard_server",
+          "json_pointer": "/standard_server",
+          "count": 46,
+          "sha256": "f92eb09fce05e8d443d47b720553f285ef4f9abddedae6e0ddc5ec967d21defe",
+          "items": [
+            "conversation.created",
+            "conversation.item.created",
+            "conversation.item.deleted",
+            "conversation.item.input_audio_transcription.completed",
+            "conversation.item.input_audio_transcription.delta",
+            "conversation.item.input_audio_transcription.failed",
+            "conversation.item.retrieved",
+            "conversation.item.truncated",
+            "error",
+            "input_audio_buffer.cleared",
+            "input_audio_buffer.committed",
+            "input_audio_buffer.dtmf_event_received",
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.speech_stopped",
+            "rate_limits.updated",
+            "response.output_audio.delta",
+            "response.output_audio.done",
+            "response.output_audio_transcript.delta",
+            "response.output_audio_transcript.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.created",
+            "response.done",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "session.created",
+            "session.updated",
+            "output_audio_buffer.started",
+            "output_audio_buffer.stopped",
+            "output_audio_buffer.cleared",
+            "conversation.item.added",
+            "conversation.item.done",
+            "input_audio_buffer.timeout_triggered",
+            "conversation.item.input_audio_transcription.segment",
+            "mcp_list_tools.in_progress",
+            "mcp_list_tools.completed",
+            "mcp_list_tools.failed",
+            "response.mcp_call_arguments.delta",
+            "response.mcp_call_arguments.done",
+            "response.mcp_call.in_progress",
+            "response.mcp_call.completed",
+            "response.mcp_call.failed"
+          ]
+        },
+        {
+          "name": "translation_client",
+          "json_pointer": "/translation_client",
+          "count": 3,
+          "sha256": "3640637b88bf115bc174444126783ad1751cf1331ecc09c2bd912009eed5c89c",
+          "items": [
+            "session.update",
+            "session.input_audio_buffer.append",
+            "session.close"
+          ]
+        },
+        {
+          "name": "translation_server",
+          "json_pointer": "/translation_server",
+          "count": 7,
+          "sha256": "1791635c8fbb0086912042b4c7247f12ca04f14c9b49063e695a224bb068ce2a",
+          "items": [
+            "error",
+            "session.created",
+            "session.updated",
+            "session.closed",
+            "session.input_transcript.delta",
+            "session.output_transcript.delta",
+            "session.output_audio.delta"
+          ]
+        }
+      ]
+    }
+  ]
+}

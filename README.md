@@ -2,11 +2,13 @@
 
 A standalone Rust proxy for GPT-Live and the OpenAI Realtime voice protocol.
 
-> The API-key profiles now implement the official Realtime REST, WebSocket, and
-> WebRTC relay surfaces. Official-SDK base-URL-only
-> conformance and final CI hardening remain tracked by [`docs/140`](docs/140_conformance-and-hardening.md),
-> so this is not yet a completed drop-in-compatibility claim. The ChatGPT
-> profile remains limited to the source-proven private V1 and Frameless flows.
+> The API-key profiles implement the official Realtime REST, WebSocket, and
+> WebRTC relay surfaces. CI verifies the helpers actually shipped by the pinned
+> OpenAI Node SDK with only `apiKey` and `baseURL` changed. Surfaces without an
+> SDK helper are tested separately against the official documented wire shape;
+> that is transport conformance, not a claim about browser media-plane behavior.
+> The ChatGPT profile remains limited to source-proven private V1 and Frameless
+> flows.
 
 It sits between a Realtime client and OpenAI, forwarding HTTP, WebSocket, and
 WebRTC signaling surfaces. In managed profiles the proxy owns
@@ -62,9 +64,11 @@ call. That rule is a named constant with the commit in its comment.
 | WS | `/v1/live/{callId}` | sideband join, path style |
 | WS | `/v1/realtime/calls/{callId}` | sideband join, path style |
 | WS | `/v1/realtime?call_id=` | sideband join, query style |
-| `GET` | `/healthz` | liveness; the only route outside the trust boundary |
+| `GET` | `/healthz` | process liveness |
+| `GET` | `/readyz` | readiness; 503 while draining or at request/connection capacity |
 
-Every route except `/healthz` sits behind a middleware layer that enforces
+`/healthz` and `/readyz` are credential-free and disclose no account or
+configuration data. Every other route sits behind middleware that enforces
 draining, admission, and origin policy, so a route added later is guarded
 whether or not its author remembers to do anything.
 
@@ -138,12 +142,27 @@ upstream bearer in `Authorization`.
 | `GPT_LIVE_ACCOUNT_ID` | — | ChatGPT account id |
 | `GPT_LIVE_API_KEY` | — | admission credential; required unless bound to loopback |
 | `GPT_LIVE_CORS_ORIGINS` | — | comma-separated extra origins |
+| `GPT_LIVE_WS_IDLE_TIMEOUT_MS` | `0` | connected WebSocket idle timeout; `0` disables it |
 | `GPT_LIVE_FRAME_LOG` | — | frame-forensics path; disabled when unset |
 | `GPT_LIVE_LOG` | `info` | tracing filter |
 
 A loopback bind exempts callers from admission auth. A non-loopback bind without
 a configured credential fails closed rather than serving the relay to the
 network unauthenticated.
+
+### Deployment security model
+
+This release is a **single-principal** relay. Admission authentication controls
+who can reach it; it does not isolate tenants or establish ownership of a call
+ID. A non-loopback bind therefore emits
+`security_model=single_principal tenant_isolation=false` at startup even when an
+admission key is configured. Loopback binds do not emit that warning. Do not
+share one instance between mutually untrusted tenants.
+
+`GPT_LIVE_WS_IDLE_TIMEOUT_MS=0` preserves official behavior by imposing no
+proxy idle cutoff. If an operator selects a nonzero value, any received data or
+control frame on either leg resets the connected timer; expiry closes both legs
+with `1001 / idle timeout` and releases the connection permit.
 
 ## Frame forensics
 
@@ -194,23 +213,32 @@ GPT_LIVE_TOKEN=sk-… \
   ./target/release/gpt-live-proxy
 ```
 
-The REST, WebSocket, and WebRTC relay paths are implemented. The official Node
-SDK base-URL-only conformance gate is still the `docs/140` work phase, so use
-the route matrix above rather than treating the current binary as a fully
-certified drop-in release. With `GPT_LIVE_UPSTREAM_MODE=chatgpt`, only private
-V1/Frameless call-create and existing-call sideband are supported; official GA,
-transcription, translation, and private standalone WebSockets are not.
+The REST, WebSocket, and WebRTC relay paths are implemented. The conformance
+suite separates two claims: `official-sdk` covers the REST and WebSocket helpers
+actually present in `openai@6.49.0`; `official-doc-transport` covers raw-SDP,
+multipart WebRTC signaling, translation, and optional browser protocols with
+raw `fetch`/`ws`. The latter does not emulate `RTCPeerConnection`. With
+`GPT_LIVE_UPSTREAM_MODE=chatgpt`, only private V1/Frameless call-create and
+existing-call sideband are supported; official GA, transcription, translation,
+and private standalone WebSockets fail before upstream contact.
 
 ## Development
 
 ```bash
-cargo test
+cargo test --locked --all-features
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
+npm ci --prefix conformance/node --ignore-scripts --no-audit --no-fund
+npm test --prefix conformance/node
+node scripts/verify-official-fixtures.mjs
+node scripts/mutation-check.mjs
 ```
 
-CI runs those three on Linux and macOS, with every action pinned to an immutable
-commit SHA.
+CI runs locked Rust checks on Linux, macOS, and Rust 1.86; hermetic official
+conformance; full-history secret and dependency audits; and a fixed mutation
+gate. Every action and downloaded security tool is pinned to immutable bytes.
+CI does not upload raw logs, headers, bodies, frames, environment files, or wire
+captures.
 
 The design notes in [`docs/`](docs) are the working record: the wire contract
 with line-level citations, the relay's observable behavior, and one document per
