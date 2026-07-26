@@ -1,6 +1,11 @@
 # gpt-live-proxy
 
-A standalone relay for the GPT-Live / OpenAI Realtime voice protocol, in Rust.
+A standalone Rust proxy for GPT-Live and the OpenAI Realtime voice protocol.
+
+> Compatibility expansion in progress: commit `de1240b` implements the
+> OpenCodex-derived WebRTC call-create and sideband subset. It is **not yet** a
+> drop-in proxy for the full official Realtime GA API. The audited contract and
+> dependency-ordered implementation roadmap begin at [`docs/080`](docs/080_official-realtime-ga-contract.md).
 
 It sits between a Codex-style voice client and OpenAI, forwarding call-create
 over HTTP and the sideband control channel over WebSockets. The proxy owns
@@ -149,7 +154,9 @@ GPT_LIVE_ACCOUNT_ID=… \
   ./target/release/gpt-live-proxy
 ```
 
-Point the client's API base at `http://127.0.0.1:10110/v1`.
+For the currently implemented OpenCodex Live subset, point the client API base
+at `http://127.0.0.1:10110/v1`. Full official base-URL compatibility is tracked
+by `docs/080` through `docs/150` and must not be assumed from the current binary.
 
 ## Development
 

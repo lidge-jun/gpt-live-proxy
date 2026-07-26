@@ -6,13 +6,29 @@ OpenCodex resolves upstream credentials through its account pool, thread affinit
 
 Consequence: the pool-derived rows of `001` §10 have no equivalent here — `429` cooldown, `409` thread affinity, and the two pool `401`s (selected-account reauthentication and pool authentication failure). Everything else in that inventory is reproduced.
 
-## D1b. Scope: relay only, not a Realtime client
+## D1b. Historical scope: relay only
 
-`000` documents the full upstream client behavior, including standalone WebSocket sessions, `session.update` emission, and the per-adapter inbound/outbound event vocabulary. **Those are explicitly out of scope.** This service is a relay: it never originates `session.update`, never normalizes events, and never opens a standalone session of its own.
+The first release deliberately implemented only call-create and sideband. That
+scope produced `de1240b` and is the baseline described by `000` through `070`.
+It is no longer the project target: `080` begins the official Realtime GA
+compatibility expansion, including standalone WebSocket and the public REST
+surface.
 
-What the wire-adapter layer (`040`) exists for is the *relay's* decisions — which `openai-alpha` value a request carries, which call-create URL shape and body shape to use, which sideband join style a call id belongs to — plus a serialization library that pins the session shapes so a test can prove a Frameless body never grows a top-level `type`. `RealtimeV2` is modeled to the extent that it must be *rejected* for WebRTC, not implemented as a transport.
+What the wire-adapter layer (`040`) exists for is the *private relay's*
+decisions — which `openai-alpha` value a request carries, which call-create URL
+shape and body shape to use, which sideband join style a call id belongs to —
+plus a serialization library that pins the session shapes so a test can prove a
+Frameless body never grows a top-level `type`. Its `RealtimeV2` WebRTC rejection
+describes the historical Codex AVAS path only. It must not be applied to the
+current official API-key GA route, which supports WebRTC; `120` separates those
+runtime policies.
 
-Anything in `000` §3.4 (RealtimeV2 session internals), §6.3 (standalone sequences), and §7 (event literals, in the linked research) is reference material for a future client, not a build target here.
+The target service will remain an opaque relay for public GA events: it will not
+originate `session.update` on behalf of an official client or normalize public
+events. Standalone-session proxying is a planned `110` deliverable; baseline
+`de1240b` does not provide it. Once that phase lands, event frames must remain
+byte- and variant-transparent. Semantic GA↔Frameless translation remains
+prohibited unless a later audited phase proves a lossless mapping; see `130`.
 
 ## D2. Crate stack
 
@@ -40,9 +56,11 @@ Even at a matching version the two sides do **not** share a message type: `axum:
 
 `tokio-util` and `subtle` are **direct** dependencies with entries in `Cargo.toml`. Being reachable transitively through another crate does not make a type importable, and a hand-rolled constant-time comparison is not offered as an interchangeable fallback on a security-sensitive path.
 
-## D3. Faithful, not "improved"
+## D3. Private baseline: faithful, not "improved"
 
-Deliberate quirks preserved from the TypeScript implementation, because a relay that "fixes" them stops being wire-compatible:
+These are deliberate quirks preserved on the private legacy path from the
+TypeScript implementation. Public GA phases may define stricter, separate
+policies without changing these private regressions:
 
 - Only `content-type` and `location` come back from the upstream response; every other header is dropped.
 - Close propagation is asymmetric: upstream → client preserves code and reason, client → upstream is normalized to `1000` / `client closed`.
