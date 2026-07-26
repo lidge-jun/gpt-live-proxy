@@ -3,6 +3,8 @@
 mod support;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use gpt_live_proxy::app::{router, AppState};
 use gpt_live_proxy::config::{AccountId, BearerToken, Config, UpstreamProfile};
@@ -119,7 +121,7 @@ async fn a_chatgpt_backend_call_rewrites_multipart_into_json() {
 #[tokio::test]
 async fn an_api_key_call_preserves_multipart_verbatim() {
     let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
-    let proxy = start_proxy(config_for(UpstreamProfile::ApiKey {
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     }))
@@ -252,7 +254,7 @@ async fn an_absent_protocol_header_is_not_invented() {
 #[tokio::test]
 async fn only_content_type_and_location_come_back() {
     let (upstream, _captures) = start_upstream(UpstreamBehavior::default()).await;
-    let proxy = start_proxy(config_for(UpstreamProfile::ApiKey {
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     }))
@@ -285,6 +287,108 @@ async fn only_content_type_and_location_come_back() {
         );
     }
     assert_eq!(response.text().await.unwrap(), "v=0\r\na=answer");
+}
+
+#[tokio::test]
+async fn a_307_is_relayed_without_replaying_body_or_credential_to_its_target() {
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let target = axum::Router::new().fallback(axum::routing::any({
+        let target_hits = target_hits.clone();
+        move || {
+            let target_hits = target_hits.clone();
+            async move {
+                target_hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }
+    }));
+    let target_listener =
+        tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(target_listener, target).await;
+    });
+
+    let redirect_location = format!("http://{target_addr}/stolen");
+    let redirector = axum::Router::new().fallback(axum::routing::any({
+        let redirect_location = redirect_location.clone();
+        move || {
+            let redirect_location = redirect_location.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(http::header::LOCATION, redirect_location)],
+                )
+            }
+        }
+    }));
+    let redirect_listener =
+        tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+    let redirect_addr = redirect_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(redirect_listener, redirector).await;
+    });
+
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
+        base_url: format!("http://{redirect_addr}/v1"),
+        auth: BearerToken::new("credential-that-must-not-be-replayed"),
+    }))
+    .await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{proxy}/v1/realtime/calls"))
+        .header("content-type", "application/octet-stream")
+        .body("body-that-must-not-be-replayed")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response.headers().get(http::header::LOCATION).unwrap(),
+        redirect_location.as_str()
+    );
+    assert_eq!(
+        target_hits.load(Ordering::SeqCst),
+        0,
+        "redirect target received the upstream credential and request body"
+    );
+}
+
+#[tokio::test]
+async fn client_credential_mode_is_not_partially_activated_on_the_legacy_handler() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let config = Config::from_source(|key| match key {
+        "GPT_LIVE_UPSTREAM_MODE" => Some("apikey".to_string()),
+        "GPT_LIVE_CREDENTIAL_MODE" => Some("client".to_string()),
+        "GPT_LIVE_BASE_URL" => Some(format!("{upstream}/v1")),
+        _ => None,
+    })
+    .expect("client config needs no managed token");
+    let proxy = start_proxy(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/realtime/calls"))
+        .header("content-type", "application/sdp")
+        .header("authorization", "Bearer caller-owned-token")
+        .body("v=0\r\na=offer")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        captures.count(),
+        0,
+        "the legacy handler must not partially apply client credential mode"
+    );
 }
 
 #[tokio::test]
@@ -352,11 +456,11 @@ async fn an_upstream_timeout_reports_504() {
     })
     .await;
 
-    let mut config = config_for(UpstreamProfile::ApiKey {
+    let mut config = config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     });
-    config.upstream_timeout = std::time::Duration::from_millis(150);
+    config.limits.upstream_timeout = std::time::Duration::from_millis(150);
     let proxy = start_proxy(config).await;
 
     let (body, content_type) = multipart_body(None);
@@ -382,7 +486,7 @@ async fn an_unreachable_upstream_reports_502() {
     let dead = listener.local_addr().unwrap();
     drop(listener);
 
-    let proxy = start_proxy(config_for(UpstreamProfile::ApiKey {
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("http://{dead}/v1"),
         auth: BearerToken::new("sk-test"),
     }))
@@ -408,11 +512,11 @@ async fn an_unreachable_upstream_reports_502() {
 #[tokio::test]
 async fn an_oversized_body_is_rejected_before_reaching_the_upstream() {
     let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
-    let mut config = config_for(UpstreamProfile::ApiKey {
+    let mut config = config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     });
-    config.max_body_bytes = 512;
+    config.limits.request_bytes = 512;
     let proxy = start_proxy(config).await;
 
     let response = reqwest::Client::new()
@@ -430,7 +534,7 @@ async fn an_oversized_body_is_rejected_before_reaching_the_upstream() {
 #[tokio::test]
 async fn a_get_on_the_call_create_path_is_not_found() {
     let (upstream, _captures) = start_upstream(UpstreamBehavior::default()).await;
-    let proxy = start_proxy(config_for(UpstreamProfile::ApiKey {
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     }))
@@ -448,11 +552,11 @@ async fn an_oversized_upstream_response_reports_502() {
     })
     .await;
 
-    let mut config = config_for(UpstreamProfile::ApiKey {
+    let mut config = config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     });
-    config.max_response_bytes = 1024;
+    config.limits.response_bytes = 1024;
     let proxy = start_proxy(config).await;
 
     let (body, content_type) = multipart_body(None);
@@ -483,11 +587,11 @@ async fn a_response_at_exactly_the_cap_is_relayed() {
     })
     .await;
 
-    let mut config = config_for(UpstreamProfile::ApiKey {
+    let mut config = config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     });
-    config.max_response_bytes = 1024;
+    config.limits.response_bytes = 1024;
     let proxy = start_proxy(config).await;
 
     let (body, content_type) = multipart_body(None);
@@ -508,7 +612,7 @@ async fn an_invalid_configured_credential_fails_loudly() {
     let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
     // A newline cannot appear in a header value; the relay must refuse rather
     // than send an unauthenticated request upstream.
-    let proxy = start_proxy(config_for(UpstreamProfile::ApiKey {
+    let proxy = start_proxy(config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("bad\nvalue"),
     }))
@@ -549,12 +653,12 @@ async fn a_downstream_disconnect_cancels_the_upstream_call() {
         })
         .await;
 
-    let mut config = config_for(UpstreamProfile::ApiKey {
+    let mut config = config_for(UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream}/v1"),
         auth: BearerToken::new("sk-test"),
     });
     // Long enough that a timeout cannot be mistaken for a cancellation.
-    config.upstream_timeout = std::time::Duration::from_secs(300);
+    config.limits.upstream_timeout = std::time::Duration::from_secs(300);
     let proxy = start_proxy(config).await;
 
     let (body, content_type) = multipart_body(None);

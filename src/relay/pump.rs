@@ -12,8 +12,8 @@ use axum::extract::ws::{Message as AxumMessage, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
-use crate::live::ws_convert::{axum_to_tungstenite, close_parts, tungstenite_to_axum};
 use crate::observability::{Direction, FrameLogger};
+use crate::relay::ws_convert::{axum_to_tungstenite, close_parts, tungstenite_to_axum};
 
 /// Record a frame immediately before it is forwarded.
 ///

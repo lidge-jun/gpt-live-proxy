@@ -135,7 +135,7 @@ use http::HeaderMap;
 use crate::app::AppState;
 use crate::error::RelayError;
 use crate::live::headers::merge_upstream_headers;
-use crate::live::pump::run_pump;
+use crate::relay::pump::run_pump;
 use crate::wire::{SidebandJoinStyle, WireAdapter};
 
 /// True when the request announces a WebSocket upgrade.

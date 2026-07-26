@@ -9,11 +9,20 @@ pub use frame_log::{Direction, FrameLogger, FrameRecord};
 /// Header names whose values are never rendered, whether or not the value was
 /// marked sensitive at construction.
 ///
-/// `x-oai-attestation` is here because it is client-supplied but copied
-/// upstream: it is bearer-grade material, not an ordinary protocol header.
-const CREDENTIAL_HEADERS: [&str; 5] = [
+/// Besides direct bearer/API-key names, this includes account-routing,
+/// idempotency, cookie, and WebSocket-subprotocol channels. The latter can carry
+/// an `openai-insecure-api-key.*` token, so the whole value is treated as secret.
+const CREDENTIAL_HEADERS: [&str; 13] = [
     "authorization",
     "chatgpt-account-id",
+    "cookie",
+    "idempotency-key",
+    "openai-organization",
+    "openai-project",
+    "openai-safety-identifier",
+    "proxy-authorization",
+    "sec-websocket-protocol",
+    "set-cookie",
     "x-api-key",
     "x-gpt-live-api-key",
     "x-oai-attestation",
@@ -77,6 +86,17 @@ mod tests {
         let map = headers(&[
             ("authorization", "Bearer super-secret"),
             ("chatgpt-account-id", "acct-secret"),
+            ("cookie", "session=cookie-secret"),
+            ("idempotency-key", "idem-secret"),
+            ("openai-organization", "org-secret"),
+            ("openai-project", "project-secret"),
+            ("openai-safety-identifier", "safety-secret"),
+            ("proxy-authorization", "Bearer proxy-auth-secret"),
+            (
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.ephemeral-secret",
+            ),
+            ("set-cookie", "session=set-cookie-secret"),
             ("x-api-key", "key-secret"),
             ("x-gpt-live-api-key", "admission-secret"),
             ("x-oai-attestation", "att-secret"),
@@ -87,6 +107,14 @@ mod tests {
         for secret in [
             "super-secret",
             "acct-secret",
+            "cookie-secret",
+            "idem-secret",
+            "org-secret",
+            "project-secret",
+            "safety-secret",
+            "proxy-auth-secret",
+            "ephemeral-secret",
+            "set-cookie-secret",
             "key-secret",
             "admission-secret",
             "att-secret",

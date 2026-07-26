@@ -88,7 +88,8 @@ pub fn merge_upstream_headers(
     // far from its cause. A configured value with control characters is a
     // configuration fault and is reported as one.
     let authorization = profile
-        .auth()
+        .managed_auth()
+        .ok_or(RelayError::NoCredential)?
         .authorization_header()
         .map_err(|_| RelayError::NoCredential)?;
     out.insert(http::header::AUTHORIZATION, authorization);
@@ -133,7 +134,7 @@ mod tests {
     }
 
     fn keyed_profile() -> UpstreamProfile {
-        UpstreamProfile::ApiKey {
+        UpstreamProfile::ApiKeyManaged {
             base_url: "https://api.openai.com/v1".into(),
             auth: BearerToken::new("sk-test-key"),
         }
@@ -271,7 +272,7 @@ mod tests {
     /// request upstream, failing far from its cause.
     #[test]
     fn a_malformed_configured_credential_is_an_error_not_a_silent_omission() {
-        let profile = UpstreamProfile::ApiKey {
+        let profile = UpstreamProfile::ApiKeyManaged {
             base_url: "https://api.openai.com/v1".into(),
             auth: BearerToken::new("bad\nvalue"),
         };

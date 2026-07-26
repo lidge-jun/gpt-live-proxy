@@ -58,6 +58,8 @@ pub enum RelayError {
     /// exactly one credential, and a duplicate-header bypass vector.
     #[error("ambiguous Authorization: send exactly one credential")]
     AmbiguousAuthorization,
+    #[error("invalid or repeated Realtime header")]
+    InvalidRealtimeHeader,
     #[error("origin rejected")]
     OriginBlocked(RequestKind),
     #[error("Service shutting down")]
@@ -83,7 +85,7 @@ impl RelayError {
             | Self::MultipartSessionNotString
             | Self::MultipartSessionNotJson
             | Self::NoUpstream => StatusCode::BAD_REQUEST,
-            Self::AmbiguousAuthorization => StatusCode::BAD_REQUEST,
+            Self::AmbiguousAuthorization | Self::InvalidRealtimeHeader => StatusCode::BAD_REQUEST,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::AdmissionRequired | Self::AdmissionSecretNotForwardable | Self::NoCredential => {
                 StatusCode::UNAUTHORIZED
@@ -327,6 +329,13 @@ mod tests {
                 "invalid_request_error",
                 "invalid_request_error",
             ),
+            (
+                RelayError::InvalidRealtimeHeader,
+                400,
+                "invalid or repeated Realtime header",
+                "invalid_request_error",
+                "invalid_request_error",
+            ),
         ]
     }
 
@@ -391,12 +400,13 @@ mod tests {
             RelayError::Draining => 18,
             RelayError::UpgradeFailed => 19,
             RelayError::UnknownEndpoint { .. } => 20,
+            RelayError::InvalidRealtimeHeader => 21,
         }
     }
 
     /// The count the table must cover. Bumping it without extending the table
     /// fails `every_variant_is_covered_by_the_contract_table`.
-    const VARIANT_COUNT: usize = 20;
+    const VARIANT_COUNT: usize = 21;
 
     /// Mechanically ties the table to the enum: adding a variant breaks compilation
     /// of `discriminant`, and deleting a row from the table breaks this test.

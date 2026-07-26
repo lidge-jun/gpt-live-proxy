@@ -18,6 +18,7 @@ use crate::app::AppState;
 use crate::config::Config;
 use crate::error::RelayError;
 use crate::live::{body, headers, url};
+use crate::relay::body::read_capped;
 use crate::wire::WireAdapter;
 
 /// Response headers relayed back downstream. Everything else — cookies, request
@@ -140,7 +141,7 @@ pub async fn handle_call_create(
 
     debug_assert_eq!(method, Method::POST);
 
-    let body_bytes = match body::read_capped(request_body, config.max_body_bytes).await {
+    let body_bytes = match read_capped(request_body, config.limits.request_bytes).await {
         Ok(bytes) => bytes,
         Err(err) => {
             slot.finish(Outcome::Failed(err.message()));
@@ -279,7 +280,7 @@ fn spawn_upstream(
                 if chunk.is_empty() {
                     continue;
                 }
-                if buffer.len().saturating_add(chunk.len()) > config.max_response_bytes {
+                if buffer.len().saturating_add(chunk.len()) > config.limits.response_bytes {
                     return Err(RelayError::ResponseTooLarge(
                         buffer.len().saturating_add(chunk.len()),
                     ));
@@ -301,7 +302,7 @@ fn spawn_upstream(
         tokio::select! {
             biased;
             () = token.cancelled() => Err(RelayError::ClientCanceled),
-            result = tokio::time::timeout(config.upstream_timeout, work) => match result {
+            result = tokio::time::timeout(config.limits.upstream_timeout, work) => match result {
                 Ok(Ok(result)) => {
                     slot.finish(Outcome::Completed(result.status.as_u16()));
                     Ok(result)

@@ -26,9 +26,6 @@ pub fn guard(
     if drain.is_draining() {
         return Err(RelayError::Draining);
     }
-    // A repeated Authorization is ambiguous for a relay that forwards exactly one
-    // credential, and is a duplicate-header bypass vector.
-    auth::reject_ambiguous_authorization(headers)?;
     auth::check_admission(headers, config)?;
     auth::reject_forwarded_admission_secret(headers, config)?;
     origin::check_origin(headers, config, kind)?;
@@ -44,6 +41,19 @@ mod tests {
         let bind = bind.to_string();
         let mut cfg = Config::from_source(|k| match k {
             "GPT_LIVE_TOKEN" => Some("upstream".to_string()),
+            "GPT_LIVE_BIND" => Some(bind.clone()),
+            _ => None,
+        })
+        .expect("config");
+        cfg.admission_token = admission.map(BearerToken::new);
+        cfg
+    }
+
+    fn client_config_with(bind: &str, admission: Option<&str>) -> Config {
+        let bind = bind.to_string();
+        let mut cfg = Config::from_source(|k| match k {
+            "GPT_LIVE_UPSTREAM_MODE" => Some("apikey".to_string()),
+            "GPT_LIVE_CREDENTIAL_MODE" => Some("client".to_string()),
             "GPT_LIVE_BIND" => Some(bind.clone()),
             _ => None,
         })
@@ -129,6 +139,42 @@ mod tests {
         let drain = DrainState::new();
         let map = headers(&[("host", "127.0.0.1:10110")]);
         assert!(guard(&map, &cfg, &drain, RequestKind::Http).is_ok());
+    }
+
+    #[test]
+    fn client_network_mode_requires_a_dedicated_admission_credential() {
+        let cfg = client_config_with("0.0.0.0:10110", Some("admission"));
+        let drain = DrainState::new();
+
+        let split = headers(&[
+            ("x-api-key", "admission"),
+            ("authorization", "Bearer upstream"),
+        ]);
+        assert!(guard(&split, &cfg, &drain, RequestKind::Http).is_ok());
+
+        let authorization_only = headers(&[("authorization", "Bearer admission")]);
+        assert!(matches!(
+            guard(&authorization_only, &cfg, &drain, RequestKind::Http),
+            Err(RelayError::AdmissionRequired)
+        ));
+    }
+
+    #[test]
+    fn loopback_still_rejects_the_admission_secret_as_upstream_auth_in_both_modes() {
+        for cfg in [
+            config_with("127.0.0.1:10110", Some("admission")),
+            client_config_with("127.0.0.1:10110", Some("admission")),
+        ] {
+            let drain = DrainState::new();
+            let map = headers(&[
+                ("host", "127.0.0.1:10110"),
+                ("authorization", "Bearer admission"),
+            ]);
+            assert!(matches!(
+                guard(&map, &cfg, &drain, RequestKind::Http),
+                Err(RelayError::AdmissionSecretNotForwardable)
+            ));
+        }
     }
 
     #[test]

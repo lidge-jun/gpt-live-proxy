@@ -29,7 +29,12 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             // The relay owns its own timeouts per request, so the client carries none.
-            http: reqwest::Client::builder().build()?,
+            // Redirects are responses to relay, never navigation instructions for
+            // the proxy: following one could replay a credential and body to an
+            // attacker-controlled location.
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             drain: DrainState::new(),
             frame_log: crate::observability::FrameLogger::from_env_owned(),
         })
@@ -264,6 +269,18 @@ mod tests {
         .expect("test config");
         config.admission_token = Some(BearerToken::new(admission));
         AppState::new(config).expect("test client")
+    }
+
+    #[test]
+    fn app_state_uses_grouped_limits() {
+        let mut grouped = Config::from_source(|k| match k {
+            "GPT_LIVE_TOKEN" => Some("test-token".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        grouped.limits.request_bytes = 321;
+        let grouped = AppState::new(grouped).unwrap();
+        assert_eq!(grouped.config.limits.request_bytes, 321);
     }
 
     #[tokio::test]

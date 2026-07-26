@@ -8,12 +8,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Upstream call-create deadline (`LIVE_UPSTREAM_TIMEOUT_MS`).
+/// Upstream request deadline (`GPT_LIVE_UPSTREAM_TIMEOUT_MS`).
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
-/// Inbound call-create body cap (`LIVE_REQUEST_MAX_BYTES`).
+/// Inbound request body cap (`GPT_LIVE_REQUEST_MAX_BYTES`).
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
-/// Buffered upstream response cap (`LIVE_RESPONSE_MAX_BYTES`).
+/// Buffered upstream response cap (`GPT_LIVE_RESPONSE_MAX_BYTES`).
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ACTIVE_CONNECTIONS: usize = 128;
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 const DEFAULT_BIND: &str = "127.0.0.1:10110";
 const CHATGPT_BACKEND_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -58,6 +63,41 @@ impl BearerToken {
     }
 }
 
+/// Whether the proxy or the caller supplies the upstream bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamCredentialMode {
+    Managed,
+    Client,
+}
+
+/// Resource and timeout limits resolved once from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    pub request_bytes: usize,
+    pub response_bytes: usize,
+    pub websocket_frame_bytes: usize,
+    pub active_connections: usize,
+    pub request_read_timeout: Duration,
+    pub upstream_timeout: Duration,
+    pub websocket_connect_timeout: Duration,
+    pub websocket_send_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            request_bytes: MAX_BODY_BYTES,
+            response_bytes: MAX_RESPONSE_BYTES,
+            websocket_frame_bytes: MAX_WEBSOCKET_FRAME_BYTES,
+            active_connections: MAX_ACTIVE_CONNECTIONS,
+            request_read_timeout: REQUEST_READ_TIMEOUT,
+            upstream_timeout: UPSTREAM_TIMEOUT,
+            websocket_connect_timeout: WEBSOCKET_CONNECT_TIMEOUT,
+            websocket_send_timeout: WEBSOCKET_SEND_TIMEOUT,
+        }
+    }
+}
+
 impl fmt::Debug for BearerToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Bearer <redacted>")
@@ -81,8 +121,10 @@ pub enum UpstreamProfile {
         /// identifier, so it is redacted in `Debug` alongside the token.
         account_id: Option<AccountId>,
     },
-    /// OpenAI API key: multipart preserved verbatim; `/v1/realtime/calls` call-create.
-    ApiKey { base_url: String, auth: BearerToken },
+    /// OpenAI API key managed by the proxy.
+    ApiKeyManaged { base_url: String, auth: BearerToken },
+    /// OpenAI API key supplied by each client request.
+    ApiKeyClient { base_url: String },
 }
 
 /// A ChatGPT account identifier that does not render itself.
@@ -108,13 +150,18 @@ impl fmt::Debug for AccountId {
 impl UpstreamProfile {
     pub fn base_url(&self) -> &str {
         match self {
-            Self::ChatGptBackend { base_url, .. } | Self::ApiKey { base_url, .. } => base_url,
+            Self::ChatGptBackend { base_url, .. }
+            | Self::ApiKeyManaged { base_url, .. }
+            | Self::ApiKeyClient { base_url } => base_url,
         }
     }
 
-    pub fn auth(&self) -> &BearerToken {
+    /// The configured upstream credential, if this profile is proxy-managed.
+    pub fn managed_auth(&self) -> Option<&BearerToken> {
         match self {
-            Self::ChatGptBackend { auth, .. } | Self::ApiKey { auth, .. } => auth,
+            Self::ChatGptBackend { auth, .. } => Some(auth),
+            Self::ApiKeyManaged { auth, .. } => Some(auth),
+            Self::ApiKeyClient { .. } => None,
         }
     }
 
@@ -122,7 +169,7 @@ impl UpstreamProfile {
     pub fn account_id(&self) -> Option<&AccountId> {
         match self {
             Self::ChatGptBackend { account_id, .. } => account_id.as_ref(),
-            Self::ApiKey { .. } => None,
+            Self::ApiKeyManaged { .. } | Self::ApiKeyClient { .. } => None,
         }
     }
 
@@ -132,7 +179,7 @@ impl UpstreamProfile {
     pub(crate) fn account_id_raw(&self) -> Option<&str> {
         match self {
             Self::ChatGptBackend { account_id, .. } => account_id.as_ref().map(AccountId::expose),
-            Self::ApiKey { .. } => None,
+            Self::ApiKeyManaged { .. } | Self::ApiKeyClient { .. } => None,
         }
     }
 
@@ -145,7 +192,16 @@ impl UpstreamProfile {
 
     /// True when the relay forwards multipart untouched instead of rewriting it.
     pub fn is_keyed(&self) -> bool {
-        matches!(self, Self::ApiKey { .. })
+        matches!(self, Self::ApiKeyManaged { .. } | Self::ApiKeyClient { .. })
+    }
+
+    pub fn credential_mode(&self) -> UpstreamCredentialMode {
+        match self {
+            Self::ChatGptBackend { .. } | Self::ApiKeyManaged { .. } => {
+                UpstreamCredentialMode::Managed
+            }
+            Self::ApiKeyClient { .. } => UpstreamCredentialMode::Client,
+        }
     }
 }
 
@@ -154,9 +210,7 @@ pub struct Config {
     pub bind: SocketAddr,
     pub upstream: UpstreamProfile,
     pub frame_log: Option<PathBuf>,
-    pub upstream_timeout: Duration,
-    pub max_body_bytes: usize,
-    pub max_response_bytes: usize,
+    pub limits: Limits,
     /// Downstream admission credential; see docs/015. `None` plus a loopback bind
     /// means admission auth is disabled.
     pub admission_token: Option<BearerToken>,
@@ -215,6 +269,48 @@ fn validate_base_url(raw: &str) -> Result<String, ConfigError> {
     Ok(trimmed.to_string())
 }
 
+fn positive_usize(
+    raw: Option<String>,
+    key: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw.parse::<usize>().map_err(|err| ConfigError::Invalid {
+        key,
+        reason: format!("expected a positive integer: {err}"),
+    })?;
+    if value == 0 {
+        return Err(ConfigError::Invalid {
+            key,
+            reason: "expected a positive integer".to_string(),
+        });
+    }
+    Ok(value)
+}
+
+fn positive_millis(
+    raw: Option<String>,
+    key: &'static str,
+    default: Duration,
+) -> Result<Duration, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw.parse::<u64>().map_err(|err| ConfigError::Invalid {
+        key,
+        reason: format!("expected a positive integer: {err}"),
+    })?;
+    if value == 0 {
+        return Err(ConfigError::Invalid {
+            key,
+            reason: "expected a positive integer".to_string(),
+        });
+    }
+    Ok(Duration::from_millis(value))
+}
+
 impl Config {
     /// Build a config from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -229,35 +325,59 @@ impl Config {
             reason: format!("{e}"),
         })?;
 
-        let token = get("GPT_LIVE_TOKEN")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .ok_or(ConfigError::Missing("GPT_LIVE_TOKEN"))?;
-        let auth = BearerToken::new(token);
+        let credential_mode = match get("GPT_LIVE_CREDENTIAL_MODE").as_deref() {
+            None | Some("managed") => UpstreamCredentialMode::Managed,
+            Some("client") => UpstreamCredentialMode::Client,
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    key: "GPT_LIVE_CREDENTIAL_MODE",
+                    reason: format!("expected `managed` or `client`, got `{other}`"),
+                });
+            }
+        };
 
         let mode = get("GPT_LIVE_UPSTREAM_MODE").unwrap_or_else(|| "chatgpt".to_string());
-        let upstream = match mode.as_str() {
-            "chatgpt" => UpstreamProfile::ChatGptBackend {
+        let managed_auth = || {
+            get("GPT_LIVE_TOKEN")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(BearerToken::new)
+                .ok_or(ConfigError::Missing("GPT_LIVE_TOKEN"))
+        };
+        let upstream = match (mode.as_str(), credential_mode) {
+            ("chatgpt", UpstreamCredentialMode::Managed) => UpstreamProfile::ChatGptBackend {
                 // An explicitly set but empty value is a configuration mistake,
                 // not a request for the default.
                 base_url: match get("GPT_LIVE_BASE_URL") {
                     Some(raw) => validate_base_url(&raw)?,
                     None => CHATGPT_BACKEND_BASE.to_string(),
                 },
-                auth,
+                auth: managed_auth()?,
                 account_id: get("GPT_LIVE_ACCOUNT_ID")
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
                     .map(AccountId::new),
             },
-            "apikey" => UpstreamProfile::ApiKey {
+            ("chatgpt", UpstreamCredentialMode::Client) => {
+                return Err(ConfigError::Invalid {
+                    key: "GPT_LIVE_CREDENTIAL_MODE",
+                    reason: "client credentials require GPT_LIVE_UPSTREAM_MODE=apikey".to_string(),
+                });
+            }
+            ("apikey", UpstreamCredentialMode::Managed) => UpstreamProfile::ApiKeyManaged {
                 base_url: match get("GPT_LIVE_BASE_URL") {
                     Some(raw) => validate_base_url(&raw)?,
                     None => OPENAI_API_BASE.to_string(),
                 },
-                auth,
+                auth: managed_auth()?,
             },
-            other => {
+            ("apikey", UpstreamCredentialMode::Client) => UpstreamProfile::ApiKeyClient {
+                base_url: match get("GPT_LIVE_BASE_URL") {
+                    Some(raw) => validate_base_url(&raw)?,
+                    None => OPENAI_API_BASE.to_string(),
+                },
+            },
+            (other, _) => {
                 return Err(ConfigError::Invalid {
                     key: "GPT_LIVE_UPSTREAM_MODE",
                     reason: format!("expected `chatgpt` or `apikey`, got `{other}`"),
@@ -289,13 +409,54 @@ impl Config {
             })
             .unwrap_or_default();
 
+        let limits = Limits {
+            request_bytes: positive_usize(
+                get("GPT_LIVE_REQUEST_MAX_BYTES"),
+                "GPT_LIVE_REQUEST_MAX_BYTES",
+                MAX_BODY_BYTES,
+            )?,
+            response_bytes: positive_usize(
+                get("GPT_LIVE_RESPONSE_MAX_BYTES"),
+                "GPT_LIVE_RESPONSE_MAX_BYTES",
+                MAX_RESPONSE_BYTES,
+            )?,
+            websocket_frame_bytes: positive_usize(
+                get("GPT_LIVE_WS_FRAME_MAX_BYTES"),
+                "GPT_LIVE_WS_FRAME_MAX_BYTES",
+                MAX_WEBSOCKET_FRAME_BYTES,
+            )?,
+            active_connections: positive_usize(
+                get("GPT_LIVE_MAX_CONNECTIONS"),
+                "GPT_LIVE_MAX_CONNECTIONS",
+                MAX_ACTIVE_CONNECTIONS,
+            )?,
+            request_read_timeout: positive_millis(
+                get("GPT_LIVE_REQUEST_READ_TIMEOUT_MS"),
+                "GPT_LIVE_REQUEST_READ_TIMEOUT_MS",
+                REQUEST_READ_TIMEOUT,
+            )?,
+            upstream_timeout: positive_millis(
+                get("GPT_LIVE_UPSTREAM_TIMEOUT_MS"),
+                "GPT_LIVE_UPSTREAM_TIMEOUT_MS",
+                UPSTREAM_TIMEOUT,
+            )?,
+            websocket_connect_timeout: positive_millis(
+                get("GPT_LIVE_WS_CONNECT_TIMEOUT_MS"),
+                "GPT_LIVE_WS_CONNECT_TIMEOUT_MS",
+                WEBSOCKET_CONNECT_TIMEOUT,
+            )?,
+            websocket_send_timeout: positive_millis(
+                get("GPT_LIVE_WS_SEND_TIMEOUT_MS"),
+                "GPT_LIVE_WS_SEND_TIMEOUT_MS",
+                WEBSOCKET_SEND_TIMEOUT,
+            )?,
+        };
+
         Ok(Self {
             bind,
             upstream,
             frame_log,
-            upstream_timeout: UPSTREAM_TIMEOUT,
-            max_body_bytes: MAX_BODY_BYTES,
-            max_response_bytes: MAX_RESPONSE_BYTES,
+            limits,
             admission_token: get("GPT_LIVE_API_KEY")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
@@ -368,6 +529,79 @@ mod tests {
         assert_eq!(cfg.upstream.base_url(), OPENAI_API_BASE);
         assert!(!cfg.upstream.uses_backend_shape());
         assert!(cfg.upstream.is_keyed());
+        assert_eq!(
+            cfg.upstream.credential_mode(),
+            UpstreamCredentialMode::Managed
+        );
+        assert!(cfg.upstream.managed_auth().is_some());
+    }
+
+    #[test]
+    fn apikey_client_mode_starts_without_or_storing_a_managed_token() {
+        let cfg = Config::from_source(source(&[
+            ("GPT_LIVE_UPSTREAM_MODE", "apikey"),
+            ("GPT_LIVE_CREDENTIAL_MODE", "client"),
+            ("GPT_LIVE_TOKEN", "must-not-be-retained"),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            cfg.upstream.credential_mode(),
+            UpstreamCredentialMode::Client
+        );
+        assert!(cfg.upstream.managed_auth().is_none());
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("must-not-be-retained"), "{rendered}");
+    }
+
+    #[test]
+    fn apikey_client_mode_needs_no_token() {
+        let cfg = Config::from_source(source(&[
+            ("GPT_LIVE_UPSTREAM_MODE", "apikey"),
+            ("GPT_LIVE_CREDENTIAL_MODE", "client"),
+        ]))
+        .unwrap();
+        assert!(cfg.upstream.managed_auth().is_none());
+    }
+
+    #[test]
+    fn managed_apikey_mode_still_requires_a_token() {
+        assert!(matches!(
+            Config::from_source(source(&[("GPT_LIVE_UPSTREAM_MODE", "apikey")])),
+            Err(ConfigError::Missing("GPT_LIVE_TOKEN"))
+        ));
+    }
+
+    #[test]
+    fn chatgpt_client_mode_is_rejected_even_when_a_token_exists() {
+        let err = Config::from_source(source(&[
+            ("GPT_LIVE_CREDENTIAL_MODE", "client"),
+            ("GPT_LIVE_TOKEN", "ignored"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                key: "GPT_LIVE_CREDENTIAL_MODE",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_credential_mode_is_rejected() {
+        let err = Config::from_source(source(&[
+            ("GPT_LIVE_TOKEN", "t"),
+            ("GPT_LIVE_CREDENTIAL_MODE", "automatic"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                key: "GPT_LIVE_CREDENTIAL_MODE",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -481,7 +715,10 @@ mod tests {
             ("GPT_LIVE_ACCOUNT_ID", "  acct-1  "),
         ]))
         .unwrap();
-        assert_eq!(cfg.upstream.auth().expose(), "spaced-token");
+        assert_eq!(
+            cfg.upstream.managed_auth().unwrap().expose(),
+            "spaced-token"
+        );
         assert_eq!(
             cfg.upstream.base_url(),
             "https://example.test/backend-api/x"
@@ -593,5 +830,86 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.cors_allow_origins, ["https://a.test", "https://b.test"]);
+    }
+
+    #[test]
+    fn limits_have_the_exact_documented_defaults() {
+        let cfg = Config::from_source(source(&[("GPT_LIVE_TOKEN", "t")])).unwrap();
+        assert_eq!(
+            cfg.limits,
+            Limits {
+                request_bytes: 16 * 1024 * 1024,
+                response_bytes: 16 * 1024 * 1024,
+                websocket_frame_bytes: 16 * 1024 * 1024,
+                active_connections: 128,
+                request_read_timeout: Duration::from_secs(30),
+                upstream_timeout: Duration::from_secs(120),
+                websocket_connect_timeout: Duration::from_secs(15),
+                websocket_send_timeout: Duration::from_secs(15),
+            }
+        );
+    }
+
+    #[test]
+    fn every_limit_uses_its_exact_environment_key() {
+        let cfg = Config::from_source(source(&[
+            ("GPT_LIVE_TOKEN", "t"),
+            ("GPT_LIVE_REQUEST_MAX_BYTES", "101"),
+            ("GPT_LIVE_RESPONSE_MAX_BYTES", "102"),
+            ("GPT_LIVE_WS_FRAME_MAX_BYTES", "103"),
+            ("GPT_LIVE_MAX_CONNECTIONS", "104"),
+            ("GPT_LIVE_REQUEST_READ_TIMEOUT_MS", "105"),
+            ("GPT_LIVE_UPSTREAM_TIMEOUT_MS", "106"),
+            ("GPT_LIVE_WS_CONNECT_TIMEOUT_MS", "107"),
+            ("GPT_LIVE_WS_SEND_TIMEOUT_MS", "108"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.limits.request_bytes, 101);
+        assert_eq!(cfg.limits.response_bytes, 102);
+        assert_eq!(cfg.limits.websocket_frame_bytes, 103);
+        assert_eq!(cfg.limits.active_connections, 104);
+        assert_eq!(cfg.limits.request_read_timeout, Duration::from_millis(105));
+        assert_eq!(cfg.limits.upstream_timeout, Duration::from_millis(106));
+        assert_eq!(
+            cfg.limits.websocket_connect_timeout,
+            Duration::from_millis(107)
+        );
+        assert_eq!(
+            cfg.limits.websocket_send_timeout,
+            Duration::from_millis(108)
+        );
+    }
+
+    #[test]
+    fn every_limit_rejects_zero_malformed_and_overflow_with_its_exact_key() {
+        let keys = [
+            "GPT_LIVE_REQUEST_MAX_BYTES",
+            "GPT_LIVE_RESPONSE_MAX_BYTES",
+            "GPT_LIVE_WS_FRAME_MAX_BYTES",
+            "GPT_LIVE_MAX_CONNECTIONS",
+            "GPT_LIVE_REQUEST_READ_TIMEOUT_MS",
+            "GPT_LIVE_UPSTREAM_TIMEOUT_MS",
+            "GPT_LIVE_WS_CONNECT_TIMEOUT_MS",
+            "GPT_LIVE_WS_SEND_TIMEOUT_MS",
+        ];
+        for key in keys {
+            for bad in [
+                "0",
+                "not-a-number",
+                "999999999999999999999999999999999999999999999999999999999999",
+            ] {
+                let err = Config::from_source(|candidate| match candidate {
+                    "GPT_LIVE_TOKEN" => Some("t".to_string()),
+                    candidate if candidate == key => Some(bad.to_string()),
+                    _ => None,
+                })
+                .unwrap_err();
+                assert!(
+                    matches!(err, ConfigError::Invalid { key: actual, .. } if actual == key),
+                    "{key}={bad} returned {err}"
+                );
+            }
+        }
     }
 }

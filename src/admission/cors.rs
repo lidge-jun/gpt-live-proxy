@@ -1,8 +1,8 @@
 //! CORS for the data plane.
 //!
-//! The six protocol header names must appear in `Access-Control-Allow-Headers`,
-//! or a browser preflight strips them and the header-loss defect that
-//! opencodex `75344b09` fixed returns through the front door.
+//! Private protocol and official public header names must appear in
+//! `Access-Control-Allow-Headers`, or a browser preflight strips them before the
+//! relay can apply its header policy.
 
 use axum::response::Response;
 use http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -14,7 +14,8 @@ pub const ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 
 pub const ALLOW_HEADERS: &str = "Content-Type, Authorization, X-GPT-Live-API-Key, X-Api-Key, \
 ChatGPT-Account-Id, OpenAI-Alpha, X-Session-Id, Session-Id, Thread-Id, Originator, \
-X-OAI-Attestation";
+X-OAI-Attestation, OpenAI-Safety-Identifier, OpenAI-Organization, OpenAI-Project, \
+OpenAI-Beta, Idempotency-Key";
 
 /// Add CORS headers to any response, including error responses.
 pub fn apply_cors(response: &mut Response, request_headers: &HeaderMap, config: &Config) {
@@ -101,6 +102,23 @@ mod tests {
                 tokens.iter().any(|t| t == name),
                 "{name} missing from Access-Control-Allow-Headers"
             );
+        }
+    }
+
+    #[test]
+    fn all_official_public_headers_are_allowed_by_exact_name() {
+        let tokens: Vec<String> = ALLOW_HEADERS
+            .split(',')
+            .map(|token| token.trim().to_ascii_lowercase())
+            .collect();
+        for name in [
+            "openai-safety-identifier",
+            "openai-organization",
+            "openai-project",
+            "openai-beta",
+            "idempotency-key",
+        ] {
+            assert!(tokens.iter().any(|token| token == name), "{name} missing");
         }
     }
 

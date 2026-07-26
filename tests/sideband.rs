@@ -71,7 +71,7 @@ async fn start_proxy(upstream_base: &str) -> String {
         _ => None,
     })
     .expect("config");
-    config.upstream = UpstreamProfile::ApiKey {
+    config.upstream = UpstreamProfile::ApiKeyManaged {
         base_url: format!("{upstream_base}/v1"),
         auth: BearerToken::new("sk-test"),
     };

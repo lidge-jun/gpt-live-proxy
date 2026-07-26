@@ -101,10 +101,52 @@ pub struct ProtocolSelection {
 The app-server RPC version is not part of this type. `v2` RPC and Realtime V2
 are separate axes (`~/Developer/codex/.../protocol/v2/realtime.rs:65`).
 
-Route classification takes method, path, the ordered query pairs, content type,
-and private negotiation header. It does not parse an entire GA session body in
-this phase. Conditional activation tests cover `model`, `call_id`, both,
-neither, duplicates, raw SDP, multipart, and translation paths.
+The exact pre-routing API is:
+
+```rust
+pub struct RouteFacts<'a> {
+    pub method: &'a Method,
+    pub path: &'a str,
+    pub query: &'a [(String, String)],
+    pub content_type: Option<&'a str>,
+    pub openai_alpha: Option<&'a str>,
+    pub credential_mode: UpstreamCredentialMode,
+}
+
+pub fn classify(facts: &RouteFacts<'_>)
+    -> Result<ProtocolSelection, ContractError>;
+```
+
+It does not parse a GA JSON session body. Known private alpha values alone
+select private dialects: `quicksilver=v1` → `QuicksilverV1` and
+`quicksilver=v2` → `Frameless`; absent or unknown values remain `OfficialGa`.
+WP1 exports classification and tests it but does not register a new endpoint.
+
+| Facts | Exact result |
+|---|---|
+| `POST /v1/realtime/calls`, multipart, no private alpha | official WebRTC, opaque session, configured managed/client policy |
+| same, `application/sdp` | official WebRTC, opaque session, `Ephemeral` |
+| same, known private alpha | matching private WebRTC, opaque session, `Managed`; client mode is a contract error |
+| `GET /v1/realtime`, exactly one `model`, no `call_id` | official standalone WS, Realtime session, configured managed/client policy |
+| same, exactly one `call_id`, no `model` | official existing-call WS, opaque session, configured managed/client policy |
+| same with both, neither, or duplicate selector keys | `ContractError::AmbiguousQuery` or `MissingSelector` |
+| `GET /v1/realtime/translations`, exactly one `model` | official translation WS, Translation session, configured managed/client policy |
+| translation path with `call_id`, missing/duplicate `model`, or private alpha | contract error |
+| exact future REST bootstrap/control path with `POST` | official `Http` with Realtime, Transcription, Translation, or Opaque kind according to `080` |
+| wrong method, malformed content type, unknown path | `MethodNotAllowed`, `UnsupportedContentType`, or `UnknownRoute` |
+
+Ordered query input preserves duplicates for rejection. Query values are not
+decoded a second time; a sole empty/whitespace selector is `MissingSelector`,
+while both selector keys are ambiguous even if one is empty. Tests fire every
+row, both credential modes, exact
+private values, an unknown alpha, selector order permutations, and cap-adjacent
+call IDs where applicable. Exact call-control segment validation remains owned
+by `100` rather than duplicated here.
+
+Content-type classification validates the full MIME token/parameter syntax,
+rejects duplicate or empty parameters, and requires exactly one non-empty
+`boundary` for multipart. It does not accept a valid-looking media type prefix
+followed by malformed parameters.
 
 ### NEW `src/realtime/headers.rs`
 
@@ -120,14 +162,52 @@ pub fn upstream_headers(
 pub fn response_headers(upstream: &HeaderMap) -> HeaderMap;
 ```
 
-Public request allowlist includes content negotiation, organization/project,
-safety identifier, official compatibility headers, and explicitly approved
-idempotency/correlation values. Authentication is inserted last according to
-`CredentialPolicy`. Private `x-oai-attestation` remains sensitive.
+The public request allowlist is exact:
 
-Safe response allowlist includes `content-type`, `location`, `retry-after`,
-request IDs, and documented OpenAI rate-limit metadata. `set-cookie`,
-`connection`, `upgrade`, transfer framing, and arbitrary headers remain absent.
+```text
+content-type, accept, openai-organization, openai-project,
+openai-safety-identifier, openai-beta, idempotency-key, openai-alpha,
+x-oai-attestation (private dialects only)
+```
+
+`openai-alpha` and `x-oai-attestation` are copied only for a recognized private
+dialect; public unknown alpha values are not allowed to switch policy.
+`content-type`, organization,
+project, safety identifier, idempotency key, alpha, and `authorization` are
+singletons: more than one value is an error. `accept` and `openai-beta` are
+list-valued and every non-empty value is appended in original order. HeaderMap
+normalizes names case-insensitively. Organization, project, safety identifier,
+idempotency key, private attestation, and every credential value are marked
+sensitive. Unknown names, empty values, admission headers, cookies, proxy
+authorization, and hop-by-hop/framing headers are dropped.
+
+`chatgpt-account-id` is inserted from the configured profile only for a selected
+private dialect. It is never emitted for `OfficialGa`, even if an invalid caller
+combines an official selection with a ChatGPT-shaped profile.
+
+Authentication is inserted last. `Managed` requires configured managed auth
+and ignores a single client Authorization value; `ClientBearer` and HTTP
+`Ephemeral` require exactly one syntactically valid `Bearer` Authorization and
+copy it sensitive. The token requires at least one RFC 6750 base character
+before optional trailing `=` padding, so padding-only values are invalid. A
+missing or repeated required credential is an error. The
+later browser-WebSocket phase obtains `Ephemeral` from its validated
+subprotocol parser rather than this HTTP header branch.
+
+The safe response allowlist is also exact:
+
+```text
+content-type, location, retry-after, x-request-id,
+openai-processing-ms, openai-version
+```
+
+In addition, any header whose normalized name starts exactly with
+`x-ratelimit-` is preserved for forward-compatible official rate-limit
+metadata. All values for allowed response names are appended in upstream order.
+`set-cookie`, `connection`, `upgrade`, `transfer-encoding`, proxy/admission
+headers, and arbitrary lookalike prefixes are absent. Exact-map tests include
+mixed case, duplicate list values, duplicate singleton rejection, a
+`x-ratelimit-` future name, a near-miss prefix, cookies, and hop-by-hop names.
 
 ### MODIFY `src/config.rs`
 
@@ -147,34 +227,96 @@ pub struct Limits {
 }
 ```
 
-`GPT_LIVE_CREDENTIAL_MODE=managed|client`, default `managed`. Client mode on a
-non-loopback bind requires `GPT_LIVE_API_KEY` in the dedicated header domain;
-an `Authorization` bearer is never silently reused for admission.
+`UpstreamProfile::ApiKey` splits into
+`ApiKeyManaged { base_url, auth }` and `ApiKeyClient { base_url }`;
+`managed_auth()` returns an option and `credential_mode()` is derived from the
+variant. `Config` stores no separately mutable mode, so a library caller cannot
+construct `Managed + None`, `Client + Some(token)`, or `ChatGPT + Client`.
+`ChatGptBackend` remains managed-only and retains a required token.
+`GPT_LIVE_CREDENTIAL_MODE=managed|client` defaults to `managed`. In API-key
+client mode `GPT_LIVE_TOKEN` is optional and is not stored even when present;
+the caller bearer is the only upstream credential. Managed mode and every
+ChatGPT profile require a non-empty token. `chatgpt + client` is a config error.
+Tests prove client mode starts with no token, its Debug has no ignored token,
+managed mode fails without one, and the invalid profile/mode pair fails.
 
-Construct the HTTP client with redirects disabled. Preserve custom `http://`
-bases for local tests/development, but document them as operator-trusted and
-require HTTPS for the default public bases.
+Environment/default mapping is exact:
+
+| Field | Environment | Default |
+|---|---|---|
+| `request_bytes` | `GPT_LIVE_REQUEST_MAX_BYTES` | 16 MiB |
+| `response_bytes` | `GPT_LIVE_RESPONSE_MAX_BYTES` | 16 MiB |
+| `websocket_frame_bytes` | `GPT_LIVE_WS_FRAME_MAX_BYTES` | 16 MiB |
+| `active_connections` | `GPT_LIVE_MAX_CONNECTIONS` | 128 |
+| `request_read_timeout` | `GPT_LIVE_REQUEST_READ_TIMEOUT_MS` | 30 s |
+| `upstream_timeout` | `GPT_LIVE_UPSTREAM_TIMEOUT_MS` | 120 s |
+| `websocket_connect_timeout` | `GPT_LIVE_WS_CONNECT_TIMEOUT_MS` | 15 s |
+| `websocket_send_timeout` | `GPT_LIVE_WS_SEND_TIMEOUT_MS` | 15 s |
+
+Positive integers only; zero, overflow, and malformed values identify the exact
+environment key in `ConfigError`. Existing `max_body_bytes`,
+`max_response_bytes`, and `upstream_timeout` call sites move to `config.limits`
+in this phase; future WS fields may remain unused public configuration until
+their owning phase.
+
+`AppState::new` constructs
+`Client::builder().redirect(reqwest::redirect::Policy::none()).build()` and
+remains fallible. Custom `http://` bases remain operator-trusted for local
+tests/development; default public bases use HTTPS. A real-socket 307 canary test
+proves the current call-create request, body, and credential never reach the
+redirect target and the 307 is relayed instead.
 
 ### MODIFY `src/admission/auth.rs` and `src/admission/mod.rs`
 
 Before: `authorization` is always an admission candidate and a matching
 admission secret is always rejected as forwardable.
 
-After: admission extraction receives the configured credential mode. In client
-mode, only `X-GPT-Live-API-Key`/`X-Api-Key` can satisfy network admission;
-`Authorization` belongs to the upstream domain. In managed mode, existing
-behavior remains. Repeated authorization remains a hard error.
+After: admission extraction receives the configured credential mode. The exact
+matrix is:
+
+| Mode/bind | Admission candidates and result | Upstream Authorization |
+|---|---|---|
+| managed, loopback | admission skipped; duplicate Authorization still rejected | configured managed token wins |
+| managed, network | strict name precedence `X-GPT-Live-API-Key` → `Authorization` → `X-Api-Key`; first non-empty name wins and any matching value within it passes | configured managed token wins |
+| client, loopback | admission skipped; duplicate Authorization still rejected | exactly one client bearer required by header builder |
+| client, network | only `X-GPT-Live-API-Key` → `X-Api-Key` participate, with the same strict precedence/any-matching-value rule; missing configured admission secret fails closed | exactly one client bearer required |
+
+A wrong higher-priority admission header is never rescued by a lower one.
+Repeated dedicated admission values retain baseline any-match semantics because
+they are proxy-only and never forwarded; repeated Authorization is always
+`AmbiguousAuthorization`. In client mode Authorization is never used to satisfy
+admission. In every mode and on loopback, an Authorization value equal to the
+configured admission secret is rejected before upstream contact. Tests cover
+every row, missing secret, wrong/high-priority values, duplicate dedicated
+values, duplicate Authorization, split credential success, and the admission
+secret canary in the upstream domain. A present non-UTF-8 value in the
+higher-priority admission name is a decisive rejection; it never disappears and
+falls through to a lower-priority secret.
 
 ### MODIFY `src/admission/cors.rs`
 
-Add `OpenAI-Safety-Identifier`, `OpenAI-Organization`, `OpenAI-Project`, and
-`OpenAI-Beta`. Browser credential-bearing WebSocket subprotocols are not a CORS
-request-header token and are governed by the handshake parser.
+Add `OpenAI-Safety-Identifier`, `OpenAI-Organization`, `OpenAI-Project`,
+`OpenAI-Beta`, and non-safelisted `Idempotency-Key`. `Accept` is already a CORS
+safelisted request header. Browser credential-bearing WebSocket subprotocols are
+not a CORS request-header token and are governed by the handshake parser.
+
+### MODIFY `src/error.rs`
+
+Add `InvalidRealtimeHeader`, rendered as `400 invalid_request_error`, so
+singleton/shape rejection is never mislabeled as a `502` upstream failure.
 
 ### MODIFY `src/app.rs`, `src/live/mod.rs`, imports and tests
 
 Register the `relay` and `realtime` modules and update moved imports. Existing
 route behavior remains unchanged in this phase.
+
+The current `/v1/realtime/calls` registration still points at the private
+legacy handler until `100`, because URL/body/header/status activation must move
+as one atomic REST slice. WP1 therefore does not claim client-mode route
+compatibility: a real-socket test pins client mode to a fail-before-contact 401
+on that legacy handler. `100` replaces that test with the successful exact-map
+client-bearer route test and is the first phase allowed to consume
+`classify`, `upstream_headers`, and `response_headers` in an official handler.
 
 ## Verification
 
@@ -188,6 +330,7 @@ cargo test live::
 cargo test --all-features
 ```
 
-Tests assert exact maps, not `contains` subsets; every credential-policy branch
-has a fired test; replacing any route/dialect/credential enum arm with its
-neighbor must fail.
+Test tables are the classifier, admission, header, config, and redirect tables
+above. Tests assert exact maps, not `contains` subsets; every policy branch has
+a fired test; replacing any route/dialect/credential enum arm with its neighbor
+must fail. The current 255-test suite remains green after ownership moves.
