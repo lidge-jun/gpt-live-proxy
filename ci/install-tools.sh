@@ -61,4 +61,4 @@ fi
 
 actionlint -version | grep -F "${ACTIONLINT_VERSION}"
 gitleaks version | grep -F "${GITLEAKS_VERSION}"
-cargo audit --version | grep -F "cargo-audit ${CARGO_AUDIT_VERSION}"
+cargo-audit --version | grep -F "cargo-audit ${CARGO_AUDIT_VERSION}"
