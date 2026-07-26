@@ -9,6 +9,8 @@ use axum::Json;
 use http::{header, Method, StatusCode};
 use serde_json::json;
 
+use crate::realtime::capability::{Capability, ProfileKind};
+
 /// Which surface rejected a request. The two origin rejections carry different
 /// exact messages, so a payload-free variant could not select between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +71,15 @@ pub enum RelayError {
     #[error("unsupported Realtime content type")]
     UnsupportedRealtimeContentType,
     #[error("Realtime operation is not supported by the configured upstream profile")]
-    UnsupportedRealtimeCapability,
+    UnsupportedRealtimeCapability {
+        capability: Capability,
+        configured_profile: ProfileKind,
+        required_profiles: &'static [ProfileKind],
+    },
+    #[error("Realtime protocol negotiation is not supported")]
+    UnsupportedRealtimeNegotiation,
+    #[error("Realtime session body contradicts the negotiated private dialect")]
+    InvalidRealtimeSessionShape,
     #[error("Realtime request body timed out")]
     RealtimeRequestBodyTimeout,
     #[error("too many active Realtime requests")]
@@ -112,7 +122,7 @@ impl RelayError {
             RestContractError::InvalidCallId => Self::InvalidRealtimeCallId,
             RestContractError::UnsupportedContentType => Self::UnsupportedRealtimeContentType,
             RestContractError::PrivateDialectRequiresManaged
-            | RestContractError::PrivateDialectNotSupported => Self::UnsupportedRealtimeCapability,
+            | RestContractError::PrivateDialectNotSupported => Self::UnsupportedRealtimeNegotiation,
         }
     }
 
@@ -136,7 +146,7 @@ impl RelayError {
             WebSocketContractError::InvalidCallId => Self::InvalidRealtimeCallId,
             WebSocketContractError::PrivateDialectRequiresManaged
             | WebSocketContractError::PrivateDialectNotSupported => {
-                Self::UnsupportedRealtimeCapability
+                Self::UnsupportedRealtimeNegotiation
             }
         }
     }
@@ -162,7 +172,9 @@ impl RelayError {
             | Self::InvalidRealtimeQuery
             | Self::InvalidRealtimeSubprotocol
             | Self::UnsupportedRealtimeContentType
-            | Self::UnsupportedRealtimeCapability => StatusCode::BAD_REQUEST,
+            | Self::UnsupportedRealtimeCapability { .. }
+            | Self::UnsupportedRealtimeNegotiation
+            | Self::InvalidRealtimeSessionShape => StatusCode::BAD_REQUEST,
             Self::RealtimeRequestBodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::TooManyActiveRealtimeRequests | Self::TooManyActiveRealtimeConnections => {
                 StatusCode::TOO_MANY_REQUESTS
@@ -219,7 +231,10 @@ impl RelayError {
             Self::InvalidRealtimeCallId => "invalid_call_id",
             Self::InvalidRealtimeQuery => "invalid_realtime_query",
             Self::InvalidRealtimeSubprotocol => "invalid_realtime_subprotocol",
-            Self::UnsupportedRealtimeCapability => "unsupported_realtime_capability",
+            Self::UnsupportedRealtimeCapability { .. } | Self::UnsupportedRealtimeNegotiation => {
+                "unsupported_realtime_capability"
+            }
+            Self::InvalidRealtimeSessionShape => "invalid_realtime_session_shape",
             Self::RealtimeRequestBodyTimeout => "request_timeout",
             Self::TooManyActiveRealtimeRequests | Self::TooManyActiveRealtimeConnections => {
                 "rate_limit_exceeded"
@@ -238,7 +253,32 @@ impl RelayError {
             Self::OriginBlocked(RequestKind::WebSocketUpgrade) => {
                 "WebSocket upgrade blocked: non-local Origin".to_string()
             }
+            Self::UnsupportedRealtimeCapability {
+                required_profiles, ..
+            } => {
+                let requirement = match *required_profiles {
+                    [ProfileKind::ApiKeyManaged, ProfileKind::ApiKeyClient] => "`apikey`",
+                    [ProfileKind::ApiKeyManaged, ProfileKind::ChatGpt] => "a managed",
+                    [ProfileKind::ApiKeyManaged] => "the `apikey_managed`",
+                    _ => "a supported",
+                };
+                format!(
+                    "gpt-live-proxy: this Realtime capability requires {requirement} upstream profile"
+                )
+            }
             other => other.to_string(),
+        }
+    }
+
+    pub fn unsupported_capability(
+        capability: Capability,
+        configured_profile: ProfileKind,
+        required_profiles: &'static [ProfileKind],
+    ) -> Self {
+        Self::UnsupportedRealtimeCapability {
+            capability,
+            configured_profile,
+            required_profiles,
         }
     }
 }
@@ -262,13 +302,34 @@ impl IntoResponse for RelayError {
             self,
             Self::TooManyActiveRealtimeRequests | Self::TooManyActiveRealtimeConnections
         );
-        let body = json!({
-            "error": {
-                "message": self.message(),
-                "type": self.error_type(),
-                "code": self.error_code(),
-            }
-        });
+        let body = match &self {
+            Self::UnsupportedRealtimeCapability {
+                capability,
+                configured_profile,
+                required_profiles,
+            } => json!({
+                "error": {
+                    "message": self.message(),
+                    "type": self.error_type(),
+                    "code": self.error_code(),
+                    "param": "upstream_profile",
+                    "source": "gpt-live-proxy",
+                    "capability": capability.label(),
+                    "configured_profile": configured_profile.label(),
+                    "required_profiles": required_profiles
+                        .iter()
+                        .map(|profile| profile.label())
+                        .collect::<Vec<_>>(),
+                }
+            }),
+            _ => json!({
+                "error": {
+                    "message": self.message(),
+                    "type": self.error_type(),
+                    "code": self.error_code(),
+                }
+            }),
+        };
         let mut response = (self.status(), Json(body)).into_response();
         if retry_after {
             response
@@ -290,6 +351,16 @@ mod tests {
         let bytes = to_bytes(res.into_body(), 64 * 1024).await.expect("body");
         let json = serde_json::from_slice(&bytes).expect("error responses are JSON");
         (status, json)
+    }
+
+    fn unsupported_official_call() -> RelayError {
+        use crate::realtime::capability::{Capability, OfficialRestCapability, ProfileKind};
+
+        RelayError::unsupported_capability(
+            Capability::OfficialRest(OfficialRestCapability::CreateCall),
+            ProfileKind::ChatGpt,
+            &[ProfileKind::ApiKeyManaged, ProfileKind::ApiKeyClient],
+        )
     }
 
     /// The contract table from docs/001 §10. Both the wire test and the coverage
@@ -475,11 +546,25 @@ mod tests {
                 "invalid_request_error",
             ),
             (
-                RelayError::UnsupportedRealtimeCapability,
+                unsupported_official_call(),
                 400,
-                "Realtime operation is not supported by the configured upstream profile",
+                "gpt-live-proxy: this Realtime capability requires `apikey` upstream profile",
                 "invalid_request_error",
                 "unsupported_realtime_capability",
+            ),
+            (
+                RelayError::UnsupportedRealtimeNegotiation,
+                400,
+                "Realtime protocol negotiation is not supported",
+                "invalid_request_error",
+                "unsupported_realtime_capability",
+            ),
+            (
+                RelayError::InvalidRealtimeSessionShape,
+                400,
+                "Realtime session body contradicts the negotiated private dialect",
+                "invalid_request_error",
+                "invalid_realtime_session_shape",
             ),
             (
                 RelayError::RealtimeRequestBodyTimeout,
@@ -590,7 +675,7 @@ mod tests {
             RelayError::InvalidRealtimeHeader => 21,
             RelayError::InvalidRealtimeCallId => 22,
             RelayError::UnsupportedRealtimeContentType => 23,
-            RelayError::UnsupportedRealtimeCapability => 24,
+            RelayError::UnsupportedRealtimeCapability { .. } => 24,
             RelayError::RealtimeRequestBodyTimeout => 25,
             RelayError::TooManyActiveRealtimeRequests => 26,
             RelayError::InvalidRealtimeQuery => 27,
@@ -599,12 +684,14 @@ mod tests {
             RelayError::RealtimeWebSocketConnectTimeout => 30,
             RelayError::RealtimeWebSocketUpstreamFailed => 31,
             RelayError::UpstreamWebSocketProtocol => 32,
+            RelayError::UnsupportedRealtimeNegotiation => 33,
+            RelayError::InvalidRealtimeSessionShape => 34,
         }
     }
 
     /// The count the table must cover. Bumping it without extending the table
     /// fails `every_variant_is_covered_by_the_contract_table`.
-    const VARIANT_COUNT: usize = 32;
+    const VARIANT_COUNT: usize = 34;
 
     /// Mechanically ties the table to the enum: adding a variant breaks compilation
     /// of `discriminant`, and deleting a row from the table breaks this test.
@@ -650,6 +737,20 @@ mod tests {
             assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
             assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "1");
         }
+    }
+
+    #[tokio::test]
+    async fn profile_capability_error_has_machine_readable_policy_fields() {
+        let (status, body) = rendered(unsupported_official_call()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["param"], "upstream_profile");
+        assert_eq!(body["error"]["source"], "gpt-live-proxy");
+        assert_eq!(body["error"]["capability"], "official_webrtc_call_create");
+        assert_eq!(body["error"]["configured_profile"], "chatgpt");
+        assert_eq!(
+            body["error"]["required_profiles"],
+            json!(["apikey_managed", "apikey_client"])
+        );
     }
 
     #[test]

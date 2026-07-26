@@ -23,12 +23,39 @@ describes the historical Codex AVAS path only. It must not be applied to the
 current official API-key GA route, which supports WebRTC; `120` separates those
 runtime policies.
 
-The target service will remain an opaque relay for public GA events: it will not
-originate `session.update` on behalf of an official client or normalize public
-events. Standalone-session proxying is a planned `110` deliverable; baseline
-`de1240b` does not provide it. Once that phase lands, event frames must remain
-byte- and variant-transparent. Semantic GA↔Frameless translation remains
-prohibited unless a later audited phase proves a lossless mapping; see `130`.
+The service remains an opaque relay for public GA events: it does not originate
+`session.update` on behalf of an official client or normalize public events.
+Official REST, standalone/existing-call/translation WebSockets, and WebRTC
+composition landed after baseline `de1240b`; event frames remain byte- and
+variant-transparent. Semantic GA↔Frameless translation remains prohibited
+unless a later audited phase proves a lossless mapping; see `130`.
+
+## D1c. Capability is explicit per surface and credential owner
+
+`Native` means the official contract is relayed without a private protocol
+adaptation. `Adapted` is a source-proven private V1 or Frameless mapping.
+`Unsupported` fails before upstream contact with
+`unsupported_realtime_capability`.
+
+| Surface | API-key managed | API-key client | ChatGPT | Required profile when unsupported |
+|---|---|---|---|---|
+| Official GA REST: voice call-create, call control, client secret, legacy session | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official transcription: session token and standalone semantics | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official translation: client secret, WebRTC call-create, WebSocket | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official standalone voice WebSocket | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official existing-call/SIP sideband WebSocket | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Private V1 call-create | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private V1 sideband, query or historical alias | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private V1 standalone WebSocket | Adapted | Unsupported | Unsupported | `apikey_managed` |
+| Private Frameless call-create | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private Frameless sideband, query or historical alias | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private Frameless standalone WebSocket | Adapted | Unsupported | Unsupported | `apikey_managed` |
+
+Public Realtime GA/V2, the private `quicksilver=v2` Frameless negotiation, and
+Codex app-server RPC v2 are three different protocols. The app-server RPC is not
+a proxy HTTP/WebSocket surface. Official SIP call controls and existing-call
+sideband are in the table; SIP trunk configuration and incoming webhook
+delivery are outside a base-URL proxy's scope.
 
 ## D2. Crate stack
 

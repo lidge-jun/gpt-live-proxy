@@ -11,6 +11,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use crate::app::AppState;
 use crate::error::RelayError;
 use crate::live::{body, url};
+use crate::realtime::capability::{support, Capability, OfficialRestCapability, ProfileKind};
+use crate::realtime::chatgpt::{classify_session, validate_session, SessionEvidenceError};
 use crate::realtime::contract::{ApiDialect, ProtocolSelection};
 use crate::relay::body::read_capped;
 use crate::relay::http::{
@@ -63,6 +65,10 @@ pub async fn handle_call_create(
         .unwrap_or(DEFAULT_CONTENT_TYPE)
         .to_string();
     let backend_shape = config.upstream.uses_backend_shape();
+    let chatgpt_profile = matches!(
+        config.upstream,
+        crate::config::UpstreamProfile::ChatGptBackend { .. }
+    );
 
     // Installed before the body read, so a client that vanishes mid-body is
     // observed by the same mechanism as one that vanishes mid-response.
@@ -99,20 +105,62 @@ pub async fn handle_call_create(
         }
     };
 
-    let (outbound_body, outbound_content_type) =
-        if backend_shape && body::is_multipart(&inbound_content_type) {
-            match body::backend_json_from_multipart(body_bytes, &inbound_content_type).await {
-                Ok((rewritten, content_type)) => (rewritten, content_type.to_string()),
-                Err(err) => {
-                    finish_error(&lifecycle, &err);
-                    return failed(err, started, lifecycle.terminal());
-                }
+    // ChatGPT always parses once for positive session evidence, including a
+    // direct API-shaped custom base. Backend-shaped targets reuse that parsed
+    // object for JSON construction; direct targets retain the original bytes.
+    let parsed_call = if chatgpt_profile || backend_shape {
+        match body::parse_private_multipart(body_bytes.clone(), &inbound_content_type).await {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                finish_error(&lifecycle, &err);
+                return failed(err, started, lifecycle.terminal());
             }
-        } else {
-            // Direct API-shaped targets forward the original bytes and boundary
-            // verbatim, independently of which profile variant supplied auth.
-            (body_bytes, inbound_content_type)
-        };
+        }
+    } else {
+        None
+    };
+
+    if chatgpt_profile {
+        if parsed_call
+            .as_ref()
+            .is_some_and(body::ParsedPrivateCall::has_duplicate_contract_fields)
+        {
+            let err = RelayError::InvalidRealtimeSessionShape;
+            finish_error(&lifecycle, &err);
+            return failed(err, started, lifecycle.terminal());
+        }
+
+        let evidence =
+            classify_session(parsed_call.as_ref().and_then(|call| call.session.as_ref()));
+        if let Err(error) = validate_session(selection.dialect, evidence) {
+            // The two official-shape cases are intentionally kept behind one
+            // narrow mapping point until the capability authority supplies its
+            // data-bearing constructor.
+            let err = match error {
+                SessionEvidenceError::InvalidShape => RelayError::InvalidRealtimeSessionShape,
+                SessionEvidenceError::OfficialRealtime => {
+                    chatgpt_official_session_error(OfficialRestCapability::CreateCall)
+                }
+                SessionEvidenceError::OfficialTranscription => chatgpt_official_session_error(
+                    OfficialRestCapability::CreateTranscriptionSession,
+                ),
+            };
+            finish_error(&lifecycle, &err);
+            return failed(err, started, lifecycle.terminal());
+        }
+    }
+
+    let (outbound_body, outbound_content_type) = if backend_shape {
+        let parsed = parsed_call
+            .as_ref()
+            .expect("backend-shaped private calls are parsed above");
+        let (rewritten, content_type) = body::backend_json_from_parsed(parsed);
+        (rewritten, content_type.to_string())
+    } else {
+        // Direct API-shaped targets forward the original bytes and boundary
+        // verbatim, independently of which profile variant supplied auth.
+        (body_bytes, inbound_content_type)
+    };
 
     let target =
         url::private_call_create_url(config.upstream.base_url(), backend_shape, selection.dialect);
@@ -175,6 +223,15 @@ pub async fn handle_call_create(
             failed(RelayError::ClientCanceled, started, lifecycle.terminal())
         }
     }
+}
+
+fn chatgpt_official_session_error(capability: OfficialRestCapability) -> RelayError {
+    let profile = ProfileKind::ChatGpt;
+    let capability = Capability::OfficialRest(capability);
+    let required_profiles = support(profile, capability)
+        .required_profiles()
+        .expect("official Realtime sessions are unsupported by ChatGPT profiles");
+    RelayError::unsupported_capability(capability, profile, required_profiles)
 }
 
 /// The inbound path, extracted so the span records the route that was actually

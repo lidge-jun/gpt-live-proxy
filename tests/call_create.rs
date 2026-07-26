@@ -13,6 +13,8 @@ use http::StatusCode;
 use support::{start_upstream, start_upstream_with_drop_signal, UpstreamBehavior};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+type MultipartField<'a> = (&'a str, &'a str, &'a str);
+
 fn config_for(profile: UpstreamProfile) -> Config {
     let mut config = Config::from_source(|k| match k {
         "GPT_LIVE_TOKEN" => Some("unused".to_string()),
@@ -53,6 +55,24 @@ fn multipart_body(session: Option<&str>) -> (Vec<u8>, String) {
         body.extend_from_slice(b"Content-Disposition: form-data; name=\"session\"\r\n");
         body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
         body.extend_from_slice(session.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+    (
+        body,
+        format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+    )
+}
+
+fn multipart_body_with_fields(fields: &[MultipartField<'_>]) -> (Vec<u8>, String) {
+    let mut body = Vec::new();
+    for (name, content_type, value) in fields {
+        body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n").as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(value.as_bytes());
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
@@ -164,7 +184,9 @@ async fn direct_base_shape_preserves_multipart_even_for_a_chatgpt_profile() {
     }))
     .await;
 
-    let (body, content_type) = multipart_body(Some(r#"{"id":"keep-me","voice":"cove"}"#));
+    let (body, content_type) = multipart_body(Some(
+        r#"{"id":"keep-me","delegation":{"type":"client"},"voice":"cove"}"#,
+    ));
     let expected_body = body.clone();
     let response = reqwest::Client::new()
         .post(format!("{proxy}/v1/live"))
@@ -183,6 +205,237 @@ async fn direct_base_shape_preserves_multipart_even_for_a_chatgpt_profile() {
         captured.headers.get("content-type").unwrap(),
         content_type.as_str()
     );
+}
+
+#[tokio::test]
+async fn chatgpt_session_evidence_and_dialect_cross_product_is_enforced_before_contact() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ChatGptBackend {
+        base_url: format!("{upstream}/backend-api/codex"),
+        auth: BearerToken::new("chatgpt-token"),
+        account_id: None,
+    }))
+    .await;
+
+    let rows = [
+        (
+            "/v1/realtime/calls",
+            "quicksilver=v1",
+            Some(r#"{"type":"quicksilver"}"#),
+            StatusCode::CREATED,
+            None,
+            true,
+        ),
+        (
+            "/v1/live",
+            "quicksilver=v2",
+            Some(r#"{"delegation":{"type":"client"}}"#),
+            StatusCode::CREATED,
+            None,
+            true,
+        ),
+        (
+            "/v1/realtime/calls",
+            "quicksilver=v1",
+            None,
+            StatusCode::CREATED,
+            None,
+            true,
+        ),
+        (
+            "/v1/live",
+            "quicksilver=v2",
+            Some(r#"{"type":"future","voice":"cove"}"#),
+            StatusCode::CREATED,
+            None,
+            true,
+        ),
+        (
+            "/v1/realtime/calls",
+            "quicksilver=v1",
+            Some(r#"{"delegation":{"type":"client"}}"#),
+            StatusCode::BAD_REQUEST,
+            Some("invalid_realtime_session_shape"),
+            false,
+        ),
+        (
+            "/v1/live",
+            "quicksilver=v2",
+            Some(r#"{"type":"quicksilver"}"#),
+            StatusCode::BAD_REQUEST,
+            Some("invalid_realtime_session_shape"),
+            false,
+        ),
+        (
+            "/v1/live",
+            "quicksilver=v2",
+            Some(r#"{"type":"future","delegation":{"type":"client"}}"#),
+            StatusCode::BAD_REQUEST,
+            Some("invalid_realtime_session_shape"),
+            false,
+        ),
+        (
+            "/v1/realtime/calls",
+            "quicksilver=v1",
+            Some(r#"{"type":"realtime"}"#),
+            StatusCode::BAD_REQUEST,
+            Some("unsupported_realtime_capability"),
+            false,
+        ),
+        (
+            "/v1/live",
+            "quicksilver=v2",
+            Some(r#"{"type":"transcription"}"#),
+            StatusCode::BAD_REQUEST,
+            Some("unsupported_realtime_capability"),
+            false,
+        ),
+    ];
+
+    for (path, alpha, session, expected_status, expected_code, contacts_upstream) in rows {
+        let before = captures.count();
+        let (body, content_type) = multipart_body(session);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy}{path}"))
+            .header("openai-alpha", alpha)
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            expected_status,
+            "path={path} alpha={alpha}"
+        );
+        if let Some(expected_code) = expected_code {
+            let value: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(
+                value["error"]["code"], expected_code,
+                "path={path} alpha={alpha}"
+            );
+        }
+        assert_eq!(
+            captures.count(),
+            before + usize::from(contacts_upstream),
+            "path={path} alpha={alpha}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_chatgpt_base_validates_evidence_without_rewriting_original_bytes() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ChatGptBackend {
+        base_url: upstream,
+        auth: BearerToken::new("chatgpt-token"),
+        account_id: None,
+    }))
+    .await;
+
+    let (matching_body, matching_type) = multipart_body(Some(
+        r#"{"delegation":{"type":"client"},"opaque_future":{"x":1}}"#,
+    ));
+    let expected = matching_body.clone();
+    let accepted = reqwest::Client::new()
+        .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
+        .header("content-type", matching_type)
+        .body(matching_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    assert_eq!(captures.last().body.as_ref(), expected.as_slice());
+
+    let before = captures.count();
+    let (mismatch_body, mismatch_type) = multipart_body(Some(r#"{"type":"quicksilver"}"#));
+    let rejected = reqwest::Client::new()
+        .post(format!("{proxy}/v1/live"))
+        .header("openai-alpha", "quicksilver=v2")
+        .header("content-type", mismatch_type)
+        .body(mismatch_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value = rejected.json().await.unwrap();
+    assert_eq!(value["error"]["code"], "invalid_realtime_session_shape");
+    assert_eq!(captures.count(), before);
+}
+
+#[tokio::test]
+async fn chatgpt_duplicate_contract_fields_are_rejected_before_upstream_contact() {
+    let (upstream, captures) = start_upstream(UpstreamBehavior::default()).await;
+    let proxy = start_proxy(config_for(UpstreamProfile::ChatGptBackend {
+        // A direct base is important here: this path forwards original bytes,
+        // so duplicate detection cannot rely on the backend JSON rewrite.
+        base_url: upstream,
+        auth: BearerToken::new("chatgpt-token"),
+        account_id: None,
+    }))
+    .await;
+
+    let rows: [(&str, Vec<MultipartField<'_>>); 3] = [
+        (
+            "matching session followed by an official session",
+            vec![
+                ("sdp", "application/sdp", "v=0"),
+                (
+                    "session",
+                    "application/json",
+                    r#"{"delegation":{"type":"client"}}"#,
+                ),
+                ("session", "application/json", r#"{"type":"realtime"}"#),
+            ],
+        ),
+        (
+            "opaque session followed by a mismatched private session",
+            vec![
+                ("sdp", "application/sdp", "v=0"),
+                (
+                    "session",
+                    "application/json",
+                    r#"{"type":"future","voice":"cove"}"#,
+                ),
+                ("session", "application/json", r#"{"type":"quicksilver"}"#),
+            ],
+        ),
+        (
+            "duplicate sdp",
+            vec![
+                ("sdp", "application/sdp", "v=0-first"),
+                ("sdp", "application/sdp", "v=0-second"),
+                (
+                    "session",
+                    "application/json",
+                    r#"{"delegation":{"type":"client"}}"#,
+                ),
+            ],
+        ),
+    ];
+
+    for (case, fields) in rows {
+        let before = captures.count();
+        let (body, content_type) = multipart_body_with_fields(&fields);
+        let response = reqwest::Client::new()
+            .post(format!("{proxy}/v1/live"))
+            .header("openai-alpha", "quicksilver=v2")
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+        let value: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            value["error"]["code"], "invalid_realtime_session_shape",
+            "{case}"
+        );
+        assert_eq!(captures.count(), before, "{case} contacted upstream");
+    }
 }
 
 #[tokio::test]

@@ -14,13 +14,14 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
 use crate::app::AppState;
-use crate::config::UpstreamProfile;
 use crate::error::RelayError;
+use crate::realtime::capability::{support, Capability, ProfileKind, Support};
 use crate::realtime::contract::{
     classify_websocket, ApiDialect, ClassifiedWebSocket, RouteFacts, WebSocketTarget,
 };
 use crate::realtime::headers::{
-    upstream_websocket_headers, websocket_response_headers, WebSocketHeaders,
+    build_upstream_websocket_headers, validate_upstream_websocket_headers,
+    websocket_response_headers, WebSocketHeaders,
 };
 use crate::realtime::{query, subprotocol};
 use crate::relay::pump::{
@@ -103,26 +104,39 @@ where
     // unsupported public semantics have one stable error. Private browser
     // channels are validated first below so they can never override managed
     // V1/Frameless authentication.
-    if classified.selection.dialect == ApiDialect::OfficialGa
-        && unsupported_profile(&state.config.upstream, &classified)
-    {
-        return RelayError::UnsupportedRealtimeCapability.into_response();
+    let capability = Capability::from_websocket(&classified);
+    let profile = ProfileKind::from_profile(&state.config.upstream);
+    let decision = support(profile, capability);
+    if classified.selection.dialect == ApiDialect::OfficialGa {
+        if let Support::Unsupported { required_profiles } = decision {
+            return RelayError::unsupported_capability(capability, profile, required_profiles)
+                .into_response();
+        }
     }
 
-    let built = match upstream_websocket_headers(
+    let validated = match validate_upstream_websocket_headers(
         &request_headers,
-        &state.config.upstream,
         &classified.selection,
         state.config.admission_token.as_ref(),
     ) {
         Ok(headers) => headers,
         Err(error) => return error.into_response(),
     };
-    if classified.selection.dialect != ApiDialect::OfficialGa
-        && unsupported_profile(&state.config.upstream, &classified)
-    {
-        return RelayError::UnsupportedRealtimeCapability.into_response();
+    if classified.selection.dialect != ApiDialect::OfficialGa {
+        if let Support::Unsupported { required_profiles } = decision {
+            return RelayError::unsupported_capability(capability, profile, required_profiles)
+                .into_response();
+        }
     }
+    let built = match build_upstream_websocket_headers(
+        &request_headers,
+        &state.config.upstream,
+        &classified.selection,
+        validated,
+    ) {
+        Ok(headers) => headers,
+        Err(error) => return error.into_response(),
+    };
     canonicalize_downstream_protocol(request.headers_mut(), &built);
 
     let upgrade = match WebSocketUpgrade::from_request(request, &()).await {
@@ -197,12 +211,6 @@ where
 {
     after_upstream_ready.await;
     owned
-}
-
-fn unsupported_profile(profile: &UpstreamProfile, classified: &ClassifiedWebSocket) -> bool {
-    matches!(profile, UpstreamProfile::ChatGptBackend { .. })
-        && (classified.selection.dialect == ApiDialect::OfficialGa
-            || matches!(classified.target, WebSocketTarget::Standalone { .. }))
 }
 
 fn configured_downstream_upgrade(upgrade: WebSocketUpgrade, state: &AppState) -> WebSocketUpgrade {
@@ -469,7 +477,7 @@ fn to_websocket_scheme(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BearerToken, UpstreamCredentialMode};
+    use crate::config::{BearerToken, UpstreamCredentialMode, UpstreamProfile};
     use crate::realtime::contract::{CredentialPolicy, ProtocolSelection, SessionKind, Transport};
     use axum::extract::ws::WebSocket;
     use axum::routing::any;
@@ -624,7 +632,13 @@ mod tests {
                 call_id: "rtc_a".into(),
             },
         );
-        assert!(unsupported_profile(&chatgpt, &official));
+        assert!(matches!(
+            support(
+                ProfileKind::from_profile(&chatgpt),
+                Capability::from_websocket(&official)
+            ),
+            Support::Unsupported { .. }
+        ));
         assert_eq!(chatgpt.credential_mode(), UpstreamCredentialMode::Managed);
     }
 

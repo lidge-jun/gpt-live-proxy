@@ -3,6 +3,8 @@
 //! This facade owns route classification and header policy. Transport handlers
 //! are added by later work phases; private wire/session adapters stay in `live`.
 
+pub mod capability;
+pub mod chatgpt;
 pub mod contract;
 pub mod headers;
 pub mod http;

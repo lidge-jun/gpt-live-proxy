@@ -14,22 +14,40 @@ pub fn is_multipart(content_type: &str) -> bool {
         .contains("multipart/form-data")
 }
 
-/// Rewrite a multipart call-create body into the backend JSON shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPrivateCall {
+    pub sdp: String,
+    pub session: Option<Value>,
+    pub sdp_fields: usize,
+    pub session_fields: usize,
+}
+
+impl ParsedPrivateCall {
+    /// Whether an ambiguous duplicate could be interpreted differently by an
+    /// upstream multipart implementation.
+    pub fn has_duplicate_contract_fields(&self) -> bool {
+        self.sdp_fields > 1 || self.session_fields > 1
+    }
+}
+
+/// Parse a private multipart call once for evidence and optional rewriting.
 ///
-/// `sdp` must be textual UTF-8. That is not a preference: the emitted body is
-/// JSON containing `"sdp": "<string>"`, and a JSON string is UTF-8 by
-/// definition, so arbitrary bytes cannot be carried there without inventing an
-/// encoding. The keyed path never rewrites and stays byte-lossless.
-pub async fn backend_json_from_multipart(
+/// `sdp` must be textual UTF-8. That is not a preference: the backend JSON
+/// shape contains a JSON string, and accepting arbitrary bytes here would
+/// silently invent an encoding. Direct API-shaped forwarding keeps a separate
+/// copy of the original bytes and therefore remains byte-identical.
+pub async fn parse_private_multipart(
     body: Bytes,
     content_type: &str,
-) -> Result<(Bytes, &'static str), RelayError> {
+) -> Result<ParsedPrivateCall, RelayError> {
     let boundary = multer::parse_boundary(content_type).map_err(|_| RelayError::MultipartParse)?;
     let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
     let mut multipart = multer::Multipart::new(stream, boundary);
 
     let mut sdp: Option<String> = None;
     let mut session_raw: Option<String> = None;
+    let mut sdp_fields = 0;
+    let mut session_fields = 0;
 
     loop {
         let field = multipart
@@ -42,7 +60,14 @@ pub async fn backend_json_from_multipart(
         // silently overriding what the client sent first.
         let name = field.name().map(str::to_string);
         match name.as_deref() {
-            Some("sdp") if sdp.is_none() => {
+            Some("sdp") => {
+                sdp_fields += 1;
+                if sdp.is_some() {
+                    // Retain duplicate evidence while preserving the legacy
+                    // first-wins value for profiles that permit it.
+                    let _ = field.bytes().await;
+                    continue;
+                }
                 // A file-valued field is not the textual field the contract
                 // specifies, and accepting it would smuggle an upload through a
                 // path that promises a string.
@@ -59,7 +84,14 @@ pub async fn backend_json_from_multipart(
                     String::from_utf8(raw.to_vec()).map_err(|_| RelayError::MultipartMissingSdp)?;
                 sdp = Some(decoded);
             }
-            Some("session") if session_raw.is_none() => {
+            Some("session") => {
+                session_fields += 1;
+                if session_raw.is_some() {
+                    // See the `sdp` branch: the caller decides whether
+                    // duplicates are compatible with its profile policy.
+                    let _ = field.bytes().await;
+                    continue;
+                }
                 if field.file_name().is_some() {
                     return Err(RelayError::MultipartSessionNotString);
                 }
@@ -79,16 +111,34 @@ pub async fn backend_json_from_multipart(
     }
 
     let sdp = sdp.ok_or(RelayError::MultipartMissingSdp)?;
-    let payload = match session_raw {
-        Some(raw) => {
-            let session: Value =
-                serde_json::from_str(&raw).map_err(|_| RelayError::MultipartSessionNotJson)?;
-            crate::wire::call_body::backend_json_call_body(&sdp, Some(&session))
-        }
-        None => crate::wire::call_body::backend_json_call_body(&sdp, None),
-    };
+    let session = session_raw
+        .map(|raw| serde_json::from_str(&raw).map_err(|_| RelayError::MultipartSessionNotJson))
+        .transpose()?;
 
-    Ok((Bytes::from(payload), "application/json"))
+    Ok(ParsedPrivateCall {
+        sdp,
+        session,
+        sdp_fields,
+        session_fields,
+    })
+}
+
+/// Build the private backend JSON shape from an already parsed call.
+pub fn backend_json_from_parsed(parsed: &ParsedPrivateCall) -> (Bytes, &'static str) {
+    let payload =
+        crate::wire::call_body::backend_json_call_body(&parsed.sdp, parsed.session.as_ref());
+
+    (Bytes::from(payload), "application/json")
+}
+
+/// Backwards-compatible one-shot helper for callers that do not need evidence.
+pub async fn backend_json_from_multipart(
+    body: Bytes,
+    content_type: &str,
+) -> Result<(Bytes, &'static str), RelayError> {
+    let parsed = parse_private_multipart(body, content_type).await?;
+
+    Ok(backend_json_from_parsed(&parsed))
 }
 
 #[cfg(test)]
@@ -175,6 +225,23 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(value["sdp"], "first");
+    }
+
+    #[tokio::test]
+    async fn duplicate_contract_fields_are_retained_as_evidence() {
+        let (body, content_type) = multipart(&[
+            ("sdp", "application/sdp", "first"),
+            ("session", "application/json", r#"{"voice":"first"}"#),
+            ("sdp", "application/sdp", "second"),
+            ("session", "application/json", r#"{"type":"realtime"}"#),
+        ]);
+        let parsed = parse_private_multipart(body, &content_type).await.unwrap();
+
+        assert_eq!(parsed.sdp, "first");
+        assert_eq!(parsed.session.as_ref().unwrap()["voice"], "first");
+        assert_eq!(parsed.sdp_fields, 2);
+        assert_eq!(parsed.session_fields, 2);
+        assert!(parsed.has_duplicate_contract_fields());
     }
 
     #[tokio::test]

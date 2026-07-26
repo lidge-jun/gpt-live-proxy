@@ -7,7 +7,7 @@ use crate::config::UpstreamCredentialMode;
 
 use super::path::{parse_rest_path, validate_call_id, PathError, RestOperation};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApiDialect {
     OfficialGa,
     QuicksilverV1,
@@ -228,12 +228,10 @@ fn classify_rest_call_create(
         return Err(RestContractError::UnsupportedContentType);
     }
     let credential = if dialect != ApiDialect::OfficialGa {
-        match facts.credential_mode {
-            UpstreamCredentialMode::Managed => CredentialPolicy::Managed,
-            UpstreamCredentialMode::Client => {
-                return Err(RestContractError::PrivateDialectRequiresManaged);
-            }
-        }
+        // Classification is independent of profile support. Private dialects
+        // are managed-credential protocols, but the central capability table
+        // owns whether the configured profile may use them.
+        CredentialPolicy::Managed
     } else if raw_sdp {
         CredentialPolicy::Ephemeral
     } else {
@@ -351,11 +349,6 @@ pub fn classify_websocket(
             )
         };
         let dialect = private_dialect(facts.openai_alpha).unwrap_or(ApiDialect::OfficialGa);
-        if dialect != ApiDialect::OfficialGa
-            && facts.credential_mode == UpstreamCredentialMode::Client
-        {
-            return Err(WebSocketContractError::PrivateDialectRequiresManaged);
-        }
         (target, transport, session_kind, dialect)
     };
 
@@ -613,7 +606,12 @@ mod tests {
                 "multipart/form-data; boundary=x",
                 Some("quicksilver=v1"),
                 UpstreamCredentialMode::Client,
-                Err(ContractError::PrivateDialectRequiresManaged),
+                Ok(selection(
+                    ApiDialect::QuicksilverV1,
+                    Transport::WebRtcCall,
+                    SessionKind::Opaque,
+                    CredentialPolicy::Managed,
+                )),
             ),
             (
                 "multipart/form-data; boundary=x",
@@ -708,7 +706,12 @@ mod tests {
                 Some("quicksilver=v2"),
                 UpstreamCredentialMode::Client,
             ),
-            Err(ContractError::PrivateDialectRequiresManaged)
+            Ok(selection(
+                ApiDialect::Frameless,
+                Transport::WebRtcCall,
+                SessionKind::Opaque,
+                CredentialPolicy::Managed,
+            ))
         );
     }
 
@@ -835,7 +838,12 @@ mod tests {
                 Some("quicksilver=v2"),
                 UpstreamCredentialMode::Client,
             )),
-            Err(ContractError::PrivateDialectRequiresManaged)
+            Ok(selection(
+                ApiDialect::Frameless,
+                Transport::StandaloneWebSocket,
+                SessionKind::Realtime,
+                CredentialPolicy::Managed,
+            ))
         );
     }
 
@@ -1293,17 +1301,6 @@ mod tests {
                     UpstreamCredentialMode::Managed,
                 ),
                 RestContractError::UnsupportedContentType,
-            ),
-            (
-                facts(
-                    &Method::POST,
-                    "/v1/realtime/calls",
-                    &empty,
-                    Some("multipart/form-data; boundary=x"),
-                    Some("quicksilver=v1"),
-                    UpstreamCredentialMode::Client,
-                ),
-                RestContractError::PrivateDialectRequiresManaged,
             ),
             (
                 facts(

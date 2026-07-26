@@ -133,7 +133,9 @@ use http::HeaderMap;
 
 use crate::app::AppState;
 use crate::error::RelayError;
-use crate::live::headers::merge_upstream_headers;
+use crate::live::headers::{merge_upstream_headers, validate_private_sideband_headers};
+use crate::realtime::capability::{support, Capability, ProfileKind, Support};
+use crate::realtime::contract::ApiDialect;
 use crate::relay::pump::{run_private_pump, ClosePolicy, PumpPolicy, MAX_WEBSOCKET_FRAME_OVERHEAD};
 use crate::wire::{SidebandJoinStyle, WireAdapter};
 
@@ -202,6 +204,9 @@ pub async fn handle_sideband(
         Ok(adapter) => adapter,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = validate_private_sideband_headers(&request_headers, adapter) {
+        return error.into_response();
+    }
 
     // Browser credential subprotocols belong exclusively to the public GA
     // surface. Reject them before taking a permit or contacting a private
@@ -213,6 +218,18 @@ pub async fn handle_sideband(
         Ok(protocols) if protocols.offered.is_empty() => {}
         Ok(_) => return RelayError::InvalidRealtimeSubprotocol.into_response(),
         Err(error) => return error.into_response(),
+    }
+
+    let dialect = match adapter {
+        WireAdapter::V1 => ApiDialect::QuicksilverV1,
+        WireAdapter::FramelessBidi => ApiDialect::Frameless,
+        WireAdapter::RealtimeV2 => unreachable!("private sideband parser excludes GA adapters"),
+    };
+    let capability = Capability::private_sideband_alias(dialect);
+    let profile = ProfileKind::from_profile(&state.config.upstream);
+    if let Support::Unsupported { required_profiles } = support(profile, capability) {
+        return RelayError::unsupported_capability(capability, profile, required_profiles)
+            .into_response();
     }
 
     let cap = state.config.limits.websocket_frame_bytes;

@@ -6,9 +6,9 @@ use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, Method, Uri};
 
 use crate::app::AppState;
-use crate::config::UpstreamProfile;
 use crate::error::RelayError;
 use crate::live::call_create::RequestPath;
+use crate::realtime::capability::{support, Capability, ProfileKind, Support};
 use crate::realtime::contract::{classify_rest, ApiDialect, RouteFacts};
 use crate::realtime::path::RestOperation;
 use crate::relay::body::read_capped;
@@ -48,30 +48,53 @@ pub async fn handle(
         }
     };
 
-    if classified.selection.dialect == ApiDialect::OfficialGa
-        && matches!(
-            &state.config.upstream,
-            UpstreamProfile::ChatGptBackend { .. }
-        )
-    {
-        return RelayError::UnsupportedRealtimeCapability.into_response();
+    let capability = Capability::from_rest(&classified);
+    let profile = ProfileKind::from_profile(&state.config.upstream);
+    let decision = support(profile, capability);
+    if classified.selection.dialect == ApiDialect::OfficialGa {
+        if let Support::Unsupported { required_profiles } = decision {
+            return RelayError::unsupported_capability(capability, profile, required_profiles)
+                .into_response();
+        }
     }
 
-    // Header construction is also validation. It runs before lifecycle setup,
-    // permit acquisition, and body read so a bad credential never consumes
-    // request capacity or reaches the upstream.
-    let upstream_headers = match if classified.selection.dialect == ApiDialect::OfficialGa {
-        crate::realtime::headers::upstream_headers(
+    // Validate protocol metadata before private capability policy, then build
+    // credentials only after policy accepts the request.
+    let private_validated = if classified.selection.dialect == ApiDialect::OfficialGa {
+        if let Err(error) = crate::realtime::headers::validate_upstream_headers(
             &request_headers,
-            &state.config.upstream,
             &classified.selection,
-        )
+        ) {
+            return error.into_response();
+        }
+        None
     } else {
-        crate::live::headers::private_call_headers(
+        match crate::live::headers::validate_private_call_headers(
+            &request_headers,
+            &classified.selection,
+        ) {
+            Ok(validated) => Some(validated),
+            Err(error) => return error.into_response(),
+        }
+    };
+    if classified.selection.dialect != ApiDialect::OfficialGa {
+        if let Support::Unsupported { required_profiles } = decision {
+            return RelayError::unsupported_capability(capability, profile, required_profiles)
+                .into_response();
+        }
+    }
+
+    let upstream_headers = match match private_validated {
+        Some(validated) => crate::live::headers::build_private_call_headers(
+            &request_headers,
+            &state.config.upstream,
+            validated,
+        ),
+        None => crate::realtime::headers::build_upstream_headers(
             &request_headers,
             &state.config.upstream,
             &classified.selection,
-        )
+        ),
     } {
         Ok(headers) => headers,
         Err(error) => return error.into_response(),

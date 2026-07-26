@@ -36,6 +36,11 @@ pub struct WebSocketHeaders {
     pub protocols: ParsedProtocols,
 }
 
+/// Credential-free result of public/private WebSocket header validation.
+pub struct ValidatedWebSocketHeaders {
+    protocols: ParsedProtocols,
+}
+
 const SINGLETON_REQUEST_HEADERS: [&str; 8] = [
     "content-type",
     "openai-organization",
@@ -60,8 +65,26 @@ pub fn upstream_headers(
     profile: &UpstreamProfile,
     selection: &ProtocolSelection,
 ) -> Result<HeaderMap, RelayError> {
-    reject_duplicate_singletons(client, selection.dialect)?;
+    validate_upstream_headers(client, selection)?;
+    build_upstream_headers(client, profile, selection)
+}
 
+/// Validate official HTTP metadata without consulting or constructing an
+/// upstream credential.
+pub fn validate_upstream_headers(
+    client: &HeaderMap,
+    selection: &ProtocolSelection,
+) -> Result<(), RelayError> {
+    reject_duplicate_singletons(client, selection.dialect)?;
+    Ok(())
+}
+
+/// Build the official HTTP header map after credential-free validation.
+pub fn build_upstream_headers(
+    client: &HeaderMap,
+    profile: &UpstreamProfile,
+    selection: &ProtocolSelection,
+) -> Result<HeaderMap, RelayError> {
     let mut out = HeaderMap::new();
     for name in REQUEST_HEADER_ALLOWLIST {
         if name == "openai-alpha" {
@@ -101,6 +124,17 @@ pub fn upstream_websocket_headers(
     selection: &ProtocolSelection,
     admission: Option<&BearerToken>,
 ) -> Result<WebSocketHeaders, RelayError> {
+    let validated = validate_upstream_websocket_headers(inbound, selection, admission)?;
+    build_upstream_websocket_headers(inbound, profile, selection, validated)
+}
+
+/// Validate WebSocket metadata and browser subprotocol authentication without
+/// resolving the configured upstream credential.
+pub fn validate_upstream_websocket_headers(
+    inbound: &HeaderMap,
+    selection: &ProtocolSelection,
+    admission: Option<&BearerToken>,
+) -> Result<ValidatedWebSocketHeaders, RelayError> {
     let protocols = subprotocol::parse(inbound, admission)?;
     reject_websocket_singletons(inbound, selection.dialect)?;
     validate_websocket_metadata(inbound)?;
@@ -120,6 +154,18 @@ pub fn upstream_websocket_headers(
         return Err(RelayError::InvalidRealtimeSubprotocol);
     }
 
+    Ok(ValidatedWebSocketHeaders { protocols })
+}
+
+/// Build the WebSocket upstream map after the authentication boundary and
+/// capability policy have accepted the request.
+pub fn build_upstream_websocket_headers(
+    inbound: &HeaderMap,
+    profile: &UpstreamProfile,
+    selection: &ProtocolSelection,
+    validated: ValidatedWebSocketHeaders,
+) -> Result<WebSocketHeaders, RelayError> {
+    let protocols = validated.protocols;
     let mut out = HeaderMap::new();
     copy_single_non_empty(inbound, &mut out, "origin", false);
     copy_single_non_empty(inbound, &mut out, "openai-organization", true);

@@ -12,8 +12,13 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::config::UpstreamProfile;
 use crate::error::RelayError;
-use crate::realtime::contract::{ApiDialect, CredentialPolicy, ProtocolSelection};
+use crate::realtime::contract::{ApiDialect, ProtocolSelection};
 use crate::wire::WireAdapter;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatedPrivateCallHeaders {
+    adapter: WireAdapter,
+}
 
 /// The only client headers forwarded upstream.
 pub const CLIENT_PROTOCOL_HEADERS: [&str; 6] = [
@@ -114,13 +119,20 @@ pub fn private_call_headers(
     profile: &UpstreamProfile,
     selection: &ProtocolSelection,
 ) -> Result<HeaderMap, RelayError> {
-    if selection.credential != CredentialPolicy::Managed {
-        return Err(RelayError::UnsupportedRealtimeCapability);
-    }
+    let validated = validate_private_call_headers(client, selection)?;
+    build_private_call_headers(client, profile, validated)
+}
+
+/// Validate the private call-create protocol shape without resolving a
+/// managed credential.
+pub fn validate_private_call_headers(
+    client: &HeaderMap,
+    selection: &ProtocolSelection,
+) -> Result<ValidatedPrivateCallHeaders, RelayError> {
     let adapter = match selection.dialect {
         ApiDialect::QuicksilverV1 => WireAdapter::V1,
         ApiDialect::Frameless => WireAdapter::FramelessBidi,
-        ApiDialect::OfficialGa => return Err(RelayError::UnsupportedRealtimeCapability),
+        ApiDialect::OfficialGa => return Err(RelayError::InvalidRealtimeHeader),
     };
 
     for name in CLIENT_PROTOCOL_HEADERS {
@@ -128,6 +140,13 @@ pub fn private_call_headers(
         if values.iter().count() > 1 || values.iter().any(|value| value.to_str().is_err()) {
             return Err(RelayError::InvalidRealtimeHeader);
         }
+    }
+    let authorization = client.get_all(http::header::AUTHORIZATION);
+    if authorization.iter().count() > 1 {
+        return Err(RelayError::AmbiguousAuthorization);
+    }
+    if authorization.iter().any(|value| value.to_str().is_err()) {
+        return Err(RelayError::InvalidRealtimeHeader);
     }
     let content_types = client.get_all(http::header::CONTENT_TYPE);
     if content_types.iter().count() != 1
@@ -140,10 +159,19 @@ pub fn private_call_headers(
         .and_then(|value| value.to_str().ok())
         .map(str::trim);
     if alpha != adapter.openai_alpha() {
-        return Err(RelayError::UnsupportedRealtimeCapability);
+        return Err(RelayError::InvalidRealtimeHeader);
     }
 
-    let mut out = merge_upstream_headers(client, profile, Some(adapter))?;
+    Ok(ValidatedPrivateCallHeaders { adapter })
+}
+
+/// Build private call-create headers after policy acceptance.
+pub fn build_private_call_headers(
+    client: &HeaderMap,
+    profile: &UpstreamProfile,
+    validated: ValidatedPrivateCallHeaders,
+) -> Result<HeaderMap, RelayError> {
+    let mut out = merge_upstream_headers(client, profile, Some(validated.adapter))?;
     out.insert(
         http::header::CONTENT_TYPE,
         client
@@ -152,6 +180,32 @@ pub fn private_call_headers(
             .clone(),
     );
     Ok(out)
+}
+
+/// Validate sideband metadata before capability policy and credential
+/// construction. The path/alpha agreement itself is owned by the sideband
+/// parser; this fixes cardinality and UTF-8 for every forwarded field.
+pub fn validate_private_sideband_headers(
+    client: &HeaderMap,
+    adapter: WireAdapter,
+) -> Result<(), RelayError> {
+    for name in CLIENT_PROTOCOL_HEADERS {
+        let values = client.get_all(name);
+        if values.iter().count() > 1 || values.iter().any(|value| value.to_str().is_err()) {
+            return Err(RelayError::InvalidRealtimeHeader);
+        }
+    }
+    if client.get_all(http::header::AUTHORIZATION).iter().count() > 1 {
+        return Err(RelayError::AmbiguousAuthorization);
+    }
+    let alpha = client
+        .get("openai-alpha")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if alpha != adapter.openai_alpha() {
+        return Err(RelayError::InvalidRealtimeHeader);
+    }
+    Ok(())
 }
 
 /// True when a header name is proxy-owned. Used by tests and diagnostics.
@@ -190,6 +244,12 @@ mod tests {
         UpstreamProfile::ApiKeyManaged {
             base_url: "https://api.openai.com/v1".into(),
             auth: BearerToken::new("sk-test-key"),
+        }
+    }
+
+    fn client_keyed_profile() -> UpstreamProfile {
+        UpstreamProfile::ApiKeyClient {
+            base_url: "https://api.openai.com/v1".into(),
         }
     }
 
@@ -238,6 +298,57 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn private_call_validation_rejects_duplicate_authorization_as_ambiguous() {
+        let client = headers(&[
+            ("openai-alpha", "quicksilver=v1"),
+            ("content-type", "multipart/form-data; boundary=x"),
+            ("authorization", "Bearer first"),
+            ("authorization", "Bearer second"),
+        ]);
+
+        assert!(matches!(
+            validate_private_call_headers(&client, &private_selection(ApiDialect::QuicksilverV1),),
+            Err(RelayError::AmbiguousAuthorization)
+        ));
+    }
+
+    #[test]
+    fn private_call_validation_rejects_non_utf8_authorization() {
+        let mut client = headers(&[
+            ("openai-alpha", "quicksilver=v1"),
+            ("content-type", "multipart/form-data; boundary=x"),
+        ]);
+        client.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+
+        assert!(matches!(
+            validate_private_call_headers(&client, &private_selection(ApiDialect::QuicksilverV1),),
+            Err(RelayError::InvalidRealtimeHeader)
+        ));
+    }
+
+    #[test]
+    fn duplicate_authorization_precedes_api_key_client_credential_failure() {
+        let client = headers(&[
+            ("openai-alpha", "quicksilver=v2"),
+            ("content-type", "multipart/form-data; boundary=x"),
+            ("authorization", "Bearer first"),
+            ("authorization", "Bearer second"),
+        ]);
+
+        assert!(matches!(
+            private_call_headers(
+                &client,
+                &client_keyed_profile(),
+                &private_selection(ApiDialect::Frameless),
+            ),
+            Err(RelayError::AmbiguousAuthorization)
+        ));
     }
 
     #[test]

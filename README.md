@@ -2,13 +2,14 @@
 
 A standalone Rust proxy for GPT-Live and the OpenAI Realtime voice protocol.
 
-> Compatibility expansion in progress: commit `de1240b` implements the
-> OpenCodex-derived WebRTC call-create and sideband subset. It is **not yet** a
-> drop-in proxy for the full official Realtime GA API. The audited contract and
-> dependency-ordered implementation roadmap begin at [`docs/080`](docs/080_official-realtime-ga-contract.md).
+> The API-key profiles now implement the official Realtime REST, WebSocket, and
+> WebRTC relay surfaces. Official-SDK base-URL-only
+> conformance and final CI hardening remain tracked by [`docs/140`](docs/140_conformance-and-hardening.md),
+> so this is not yet a completed drop-in-compatibility claim. The ChatGPT
+> profile remains limited to the source-proven private V1 and Frameless flows.
 
-It sits between a Codex-style voice client and OpenAI, forwarding call-create
-over HTTP and the sideband control channel over WebSockets. The proxy owns
+It sits between a Realtime client and OpenAI, forwarding HTTP, WebSocket, and
+WebRTC signaling surfaces. In managed profiles the proxy owns
 authentication and otherwise stays out of the way: sideband **data frames** are
 relayed verbatim, text as text and binary as binary, with no parsing or
 re-encoding.
@@ -23,7 +24,8 @@ It is not a pure pipe, and the exceptions are deliberate:
   the client put there survives.
 - A client close code is normalized to `1000` before it reaches the upstream.
 - Ping and pong are answered per leg rather than forwarded.
-- Only `content-type` and `location` come back from the upstream response.
+- On private legacy call-create only, the response keeps `content-type` and
+  `location`; official responses use the audited metadata allowlist.
 
 This is a reimplementation of the relay in
 [OpenCodex](https://github.com/lidge-jun/opencodex). The contract was
@@ -68,13 +70,41 @@ whether or not its author remembers to do anything.
 
 ## Upstream profiles
 
-| Mode | Base | Call-create body | Sideband host |
+| Profile | Configuration | Credential owner | Default base |
 |---|---|---|---|
-| `chatgpt` | `https://chatgpt.com/backend-api/codex` | JSON `{sdp, session?}` | `api.openai.com` |
-| `apikey` | `https://api.openai.com/v1` | multipart, forwarded verbatim | the configured base |
+| API-key managed | `GPT_LIVE_UPSTREAM_MODE=apikey` | proxy (`GPT_LIVE_TOKEN`) | `https://api.openai.com/v1` |
+| API-key client | `GPT_LIVE_UPSTREAM_MODE=apikey`, `GPT_LIVE_CREDENTIAL_MODE=client` | each request or WebSocket subprotocol | `https://api.openai.com/v1` |
+| ChatGPT managed | `GPT_LIVE_UPSTREAM_MODE=chatgpt` | proxy token and optional account id | `https://chatgpt.com/backend-api/codex` |
 
 The body shape follows the base URL rather than the mode, matching upstream: a
 base containing `/backend-api` gets the JSON shape wherever it points.
+
+## Realtime surface matrix
+
+`Native` relays the official contract without a private protocol adaptation.
+`Adapted` is a source-proven private V1 or Frameless mapping. `Unsupported`
+fails before upstream contact with `unsupported_realtime_capability`.
+
+| Surface | API-key managed | API-key client | ChatGPT | Required profile when unsupported |
+|---|---|---|---|---|
+| Official GA REST: voice call-create, call control, client secret, legacy session | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official transcription: session token and standalone semantics | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official translation: client secret, WebRTC call-create, WebSocket | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official standalone voice WebSocket | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Official existing-call/SIP sideband WebSocket | Native | Native | Unsupported | `apikey_managed` or `apikey_client` |
+| Private V1 call-create | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private V1 sideband, query or historical alias | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private V1 standalone WebSocket | Adapted | Unsupported | Unsupported | `apikey_managed` |
+| Private Frameless call-create | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private Frameless sideband, query or historical alias | Adapted | Unsupported | Adapted | managed: `apikey_managed` or `chatgpt` |
+| Private Frameless standalone WebSocket | Adapted | Unsupported | Unsupported | `apikey_managed` |
+
+Three similarly named concepts are intentionally separate: public Realtime
+GA/V2 is the official API surface; `quicksilver=v2` is the private Frameless
+negotiation token; Codex app-server RPC v2 is not an HTTP/WebSocket route owned
+by this proxy. SIP call control and existing-call sideband are covered above,
+but SIP trunk configuration and incoming webhook delivery cannot be selected by
+changing an API base URL and are out of scope.
 
 ## Header ownership
 
@@ -102,8 +132,9 @@ upstream bearer in `Authorization`.
 |---|---|---|
 | `GPT_LIVE_BIND` | `127.0.0.1:10110` | listen address |
 | `GPT_LIVE_UPSTREAM_MODE` | `chatgpt` | `chatgpt` or `apikey` |
+| `GPT_LIVE_CREDENTIAL_MODE` | `managed` | `managed` or client-supplied `client`; client mode requires `apikey` |
 | `GPT_LIVE_BASE_URL` | per mode | upstream base; no query, fragment, or userinfo |
-| `GPT_LIVE_TOKEN` | required | upstream bearer |
+| `GPT_LIVE_TOKEN` | required in managed mode | proxy-owned upstream bearer; omitted in client mode |
 | `GPT_LIVE_ACCOUNT_ID` | — | ChatGPT account id |
 | `GPT_LIVE_API_KEY` | — | admission credential; required unless bound to loopback |
 | `GPT_LIVE_CORS_ORIGINS` | — | comma-separated extra origins |
@@ -154,9 +185,21 @@ GPT_LIVE_ACCOUNT_ID=… \
   ./target/release/gpt-live-proxy
 ```
 
-For the currently implemented OpenCodex Live subset, point the client API base
-at `http://127.0.0.1:10110/v1`. Full official base-URL compatibility is tracked
-by `docs/080` through `docs/150` and must not be assumed from the current binary.
+For official Realtime routes, run the `apikey` profile and point the client API
+base at `http://127.0.0.1:10110/v1`:
+
+```bash
+GPT_LIVE_UPSTREAM_MODE=apikey \
+GPT_LIVE_TOKEN=sk-… \
+  ./target/release/gpt-live-proxy
+```
+
+The REST, WebSocket, and WebRTC relay paths are implemented. The official Node
+SDK base-URL-only conformance gate is still the `docs/140` work phase, so use
+the route matrix above rather than treating the current binary as a fully
+certified drop-in release. With `GPT_LIVE_UPSTREAM_MODE=chatgpt`, only private
+V1/Frameless call-create and existing-call sideband are supported; official GA,
+transcription, translation, and private standalone WebSockets are not.
 
 ## Development
 
