@@ -62,6 +62,10 @@ pub enum RelayError {
     InvalidRealtimeHeader,
     #[error("invalid Realtime call_id")]
     InvalidRealtimeCallId,
+    #[error("invalid Realtime WebSocket query")]
+    InvalidRealtimeQuery,
+    #[error("invalid Realtime WebSocket subprotocol")]
+    InvalidRealtimeSubprotocol,
     #[error("unsupported Realtime content type")]
     UnsupportedRealtimeContentType,
     #[error("Realtime operation is not supported by the configured upstream profile")]
@@ -70,6 +74,14 @@ pub enum RelayError {
     RealtimeRequestBodyTimeout,
     #[error("too many active Realtime requests")]
     TooManyActiveRealtimeRequests,
+    #[error("too many active Realtime connections")]
+    TooManyActiveRealtimeConnections,
+    #[error("Realtime upstream WebSocket handshake timed out")]
+    RealtimeWebSocketConnectTimeout,
+    #[error("Realtime upstream WebSocket handshake failed")]
+    RealtimeWebSocketUpstreamFailed,
+    #[error("Realtime upstream selected an invalid WebSocket subprotocol")]
+    UpstreamWebSocketProtocol,
     #[error("origin rejected")]
     OriginBlocked(RequestKind),
     #[error("Service shutting down")]
@@ -104,10 +116,38 @@ impl RelayError {
         }
     }
 
+    pub fn from_websocket_contract(
+        error: crate::realtime::contract::WebSocketContractError,
+        method: &Method,
+        path: &str,
+    ) -> Self {
+        use crate::realtime::contract::WebSocketContractError;
+
+        match error {
+            WebSocketContractError::UnknownRoute | WebSocketContractError::MethodNotAllowed => {
+                Self::UnknownEndpoint {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                }
+            }
+            WebSocketContractError::MissingSelector | WebSocketContractError::AmbiguousQuery => {
+                Self::InvalidRealtimeQuery
+            }
+            WebSocketContractError::InvalidCallId => Self::InvalidRealtimeCallId,
+            WebSocketContractError::PrivateDialectRequiresManaged
+            | WebSocketContractError::PrivateDialectNotSupported => {
+                Self::UnsupportedRealtimeCapability
+            }
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::ResponseTooLarge(_) | Self::UpstreamFailed(_) => StatusCode::BAD_GATEWAY,
+            Self::ResponseTooLarge(_)
+            | Self::UpstreamFailed(_)
+            | Self::RealtimeWebSocketUpstreamFailed
+            | Self::UpstreamWebSocketProtocol => StatusCode::BAD_GATEWAY,
             // 499 is not an IANA status; the source emits it and clients key off it.
             Self::ClientCanceled => StatusCode::from_u16(499).expect("499 is a valid status code"),
             Self::BodyUnreadable(_)
@@ -119,11 +159,17 @@ impl RelayError {
             Self::AmbiguousAuthorization
             | Self::InvalidRealtimeHeader
             | Self::InvalidRealtimeCallId
+            | Self::InvalidRealtimeQuery
+            | Self::InvalidRealtimeSubprotocol
             | Self::UnsupportedRealtimeContentType
             | Self::UnsupportedRealtimeCapability => StatusCode::BAD_REQUEST,
             Self::RealtimeRequestBodyTimeout => StatusCode::REQUEST_TIMEOUT,
-            Self::TooManyActiveRealtimeRequests => StatusCode::TOO_MANY_REQUESTS,
-            Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::TooManyActiveRealtimeRequests | Self::TooManyActiveRealtimeConnections => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            Self::UpstreamTimeout | Self::RealtimeWebSocketConnectTimeout => {
+                StatusCode::GATEWAY_TIMEOUT
+            }
             Self::AdmissionRequired | Self::AdmissionSecretNotForwardable | Self::NoCredential => {
                 StatusCode::UNAUTHORIZED
             }
@@ -140,10 +186,15 @@ impl RelayError {
             Self::AdmissionRequired | Self::AdmissionSecretNotForwardable | Self::NoCredential => {
                 "authentication_error"
             }
-            Self::TooManyActiveRealtimeRequests => "rate_limit_error",
-            Self::ResponseTooLarge(_) | Self::UpstreamFailed(_) | Self::UpstreamTimeout => {
-                "server_error"
+            Self::TooManyActiveRealtimeRequests | Self::TooManyActiveRealtimeConnections => {
+                "rate_limit_error"
             }
+            Self::ResponseTooLarge(_)
+            | Self::UpstreamFailed(_)
+            | Self::UpstreamTimeout
+            | Self::RealtimeWebSocketConnectTimeout
+            | Self::RealtimeWebSocketUpstreamFailed
+            | Self::UpstreamWebSocketProtocol => "server_error",
             _ => "invalid_request_error",
         }
     }
@@ -152,9 +203,11 @@ impl RelayError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::ClientCanceled => "client_closed_request",
-            Self::ResponseTooLarge(_) | Self::UpstreamFailed(_) | Self::UpstreamTimeout => {
-                "upstream_server_error"
-            }
+            Self::ResponseTooLarge(_)
+            | Self::UpstreamFailed(_)
+            | Self::UpstreamTimeout
+            | Self::RealtimeWebSocketConnectTimeout
+            | Self::RealtimeWebSocketUpstreamFailed => "upstream_server_error",
             Self::AdmissionRequired | Self::AdmissionSecretNotForwardable | Self::NoCredential => {
                 "invalid_api_key"
             }
@@ -164,9 +217,14 @@ impl RelayError {
             Self::OriginBlocked(_) => "origin_rejected",
             Self::UpgradeFailed => "upgrade_required",
             Self::InvalidRealtimeCallId => "invalid_call_id",
+            Self::InvalidRealtimeQuery => "invalid_realtime_query",
+            Self::InvalidRealtimeSubprotocol => "invalid_realtime_subprotocol",
             Self::UnsupportedRealtimeCapability => "unsupported_realtime_capability",
             Self::RealtimeRequestBodyTimeout => "request_timeout",
-            Self::TooManyActiveRealtimeRequests => "rate_limit_exceeded",
+            Self::TooManyActiveRealtimeRequests | Self::TooManyActiveRealtimeConnections => {
+                "rate_limit_exceeded"
+            }
+            Self::UpstreamWebSocketProtocol => "upstream_websocket_protocol_error",
             _ => "invalid_request_error",
         }
     }
@@ -200,7 +258,10 @@ impl IntoResponse for RelayError {
                 .into_response();
         }
 
-        let retry_after = matches!(self, Self::TooManyActiveRealtimeRequests);
+        let retry_after = matches!(
+            self,
+            Self::TooManyActiveRealtimeRequests | Self::TooManyActiveRealtimeConnections
+        );
         let body = json!({
             "error": {
                 "message": self.message(),
@@ -393,6 +454,20 @@ mod tests {
                 "invalid_call_id",
             ),
             (
+                RelayError::InvalidRealtimeQuery,
+                400,
+                "invalid Realtime WebSocket query",
+                "invalid_request_error",
+                "invalid_realtime_query",
+            ),
+            (
+                RelayError::InvalidRealtimeSubprotocol,
+                400,
+                "invalid Realtime WebSocket subprotocol",
+                "invalid_request_error",
+                "invalid_realtime_subprotocol",
+            ),
+            (
                 RelayError::UnsupportedRealtimeContentType,
                 400,
                 "unsupported Realtime content type",
@@ -419,6 +494,34 @@ mod tests {
                 "too many active Realtime requests",
                 "rate_limit_error",
                 "rate_limit_exceeded",
+            ),
+            (
+                RelayError::TooManyActiveRealtimeConnections,
+                429,
+                "too many active Realtime connections",
+                "rate_limit_error",
+                "rate_limit_exceeded",
+            ),
+            (
+                RelayError::RealtimeWebSocketConnectTimeout,
+                504,
+                "Realtime upstream WebSocket handshake timed out",
+                "server_error",
+                "upstream_server_error",
+            ),
+            (
+                RelayError::RealtimeWebSocketUpstreamFailed,
+                502,
+                "Realtime upstream WebSocket handshake failed",
+                "server_error",
+                "upstream_server_error",
+            ),
+            (
+                RelayError::UpstreamWebSocketProtocol,
+                502,
+                "Realtime upstream selected an invalid WebSocket subprotocol",
+                "server_error",
+                "upstream_websocket_protocol_error",
             ),
         ]
     }
@@ -490,12 +593,18 @@ mod tests {
             RelayError::UnsupportedRealtimeCapability => 24,
             RelayError::RealtimeRequestBodyTimeout => 25,
             RelayError::TooManyActiveRealtimeRequests => 26,
+            RelayError::InvalidRealtimeQuery => 27,
+            RelayError::InvalidRealtimeSubprotocol => 28,
+            RelayError::TooManyActiveRealtimeConnections => 29,
+            RelayError::RealtimeWebSocketConnectTimeout => 30,
+            RelayError::RealtimeWebSocketUpstreamFailed => 31,
+            RelayError::UpstreamWebSocketProtocol => 32,
         }
     }
 
     /// The count the table must cover. Bumping it without extending the table
     /// fails `every_variant_is_covered_by_the_contract_table`.
-    const VARIANT_COUNT: usize = 26;
+    const VARIANT_COUNT: usize = 32;
 
     /// Mechanically ties the table to the enum: adding a variant breaks compilation
     /// of `discriminant`, and deleting a row from the table breaks this test.
@@ -533,9 +642,14 @@ mod tests {
 
     #[tokio::test]
     async fn active_request_limit_has_retry_after_one() {
-        let res = RelayError::TooManyActiveRealtimeRequests.into_response();
-        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        for error in [
+            RelayError::TooManyActiveRealtimeRequests,
+            RelayError::TooManyActiveRealtimeConnections,
+        ] {
+            let res = error.into_response();
+            assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        }
     }
 
     #[test]
@@ -579,6 +693,57 @@ mod tests {
 
         for (contract, status, code) in rows {
             let wire = RelayError::from_rest_contract(contract, &method, path);
+            assert_eq!(wire.status(), status, "contract={contract:?}");
+            assert_eq!(wire.error_code(), code, "contract={contract:?}");
+        }
+    }
+
+    #[test]
+    fn every_websocket_contract_error_has_one_wire_mapping() {
+        use crate::realtime::contract::WebSocketContractError;
+
+        let method = Method::PATCH;
+        let path = "/v1/realtime";
+        let rows = [
+            (
+                WebSocketContractError::UnknownRoute,
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+            ),
+            (
+                WebSocketContractError::MethodNotAllowed,
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+            ),
+            (
+                WebSocketContractError::MissingSelector,
+                StatusCode::BAD_REQUEST,
+                "invalid_realtime_query",
+            ),
+            (
+                WebSocketContractError::AmbiguousQuery,
+                StatusCode::BAD_REQUEST,
+                "invalid_realtime_query",
+            ),
+            (
+                WebSocketContractError::InvalidCallId,
+                StatusCode::BAD_REQUEST,
+                "invalid_call_id",
+            ),
+            (
+                WebSocketContractError::PrivateDialectRequiresManaged,
+                StatusCode::BAD_REQUEST,
+                "unsupported_realtime_capability",
+            ),
+            (
+                WebSocketContractError::PrivateDialectNotSupported,
+                StatusCode::BAD_REQUEST,
+                "unsupported_realtime_capability",
+            ),
+        ];
+
+        for (contract, status, code) in rows {
+            let wire = RelayError::from_websocket_contract(contract, &method, path);
             assert_eq!(wire.status(), status, "contract={contract:?}");
             assert_eq!(wire.error_code(), code, "contract={contract:?}");
         }

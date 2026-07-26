@@ -2,9 +2,10 @@
 
 use http::{header, HeaderMap, HeaderName, HeaderValue};
 
-use crate::config::UpstreamProfile;
+use crate::config::{BearerToken, UpstreamProfile};
 use crate::error::RelayError;
 use crate::realtime::contract::{ApiDialect, CredentialPolicy, ProtocolSelection};
+use crate::realtime::subprotocol::{self, ParsedProtocols};
 
 pub const REQUEST_HEADER_ALLOWLIST: [&str; 9] = [
     "content-type",
@@ -26,6 +27,14 @@ pub const RESPONSE_HEADER_ALLOWLIST: [&str; 6] = [
     "openai-processing-ms",
     "openai-version",
 ];
+
+pub const WEBSOCKET_RESPONSE_HEADER_ALLOWLIST: [&str; 3] =
+    ["x-request-id", "openai-processing-ms", "openai-version"];
+
+pub struct WebSocketHeaders {
+    pub headers: HeaderMap,
+    pub protocols: ParsedProtocols,
+}
 
 const SINGLETON_REQUEST_HEADERS: [&str; 8] = [
     "content-type",
@@ -86,6 +95,64 @@ pub fn upstream_headers(
     Ok(out)
 }
 
+pub fn upstream_websocket_headers(
+    inbound: &HeaderMap,
+    profile: &UpstreamProfile,
+    selection: &ProtocolSelection,
+    admission: Option<&BearerToken>,
+) -> Result<WebSocketHeaders, RelayError> {
+    let protocols = subprotocol::parse(inbound, admission)?;
+    reject_websocket_singletons(inbound, selection.dialect)?;
+    validate_websocket_metadata(inbound)?;
+
+    if selection.dialect != ApiDialect::OfficialGa && !protocols.offered.is_empty() {
+        return Err(RelayError::InvalidRealtimeSubprotocol);
+    }
+
+    if (protocols.has_organization && inbound.contains_key("openai-organization"))
+        || (protocols.has_project && inbound.contains_key("openai-project"))
+    {
+        return Err(RelayError::InvalidRealtimeSubprotocol);
+    }
+
+    let authorization_count = inbound.get_all(header::AUTHORIZATION).iter().count();
+    if protocols.browser_credential.is_some() && authorization_count != 0 {
+        return Err(RelayError::InvalidRealtimeSubprotocol);
+    }
+
+    let mut out = HeaderMap::new();
+    copy_single_non_empty(inbound, &mut out, "origin", false);
+    copy_single_non_empty(inbound, &mut out, "openai-organization", true);
+    copy_single_non_empty(inbound, &mut out, "openai-project", true);
+    copy_single_non_empty(inbound, &mut out, "openai-safety-identifier", true);
+    append_non_empty_values(inbound, &mut out, "openai-beta", false);
+    copy_private_alpha(inbound, &mut out, selection.dialect)?;
+    if selection.dialect != ApiDialect::OfficialGa {
+        copy_single_non_empty(inbound, &mut out, "x-oai-attestation", true);
+        if let Some(account_id) = profile.account_id_raw() {
+            let mut value =
+                HeaderValue::from_str(account_id).map_err(|_| RelayError::InvalidRealtimeHeader)?;
+            value.set_sensitive(true);
+            out.insert(HeaderName::from_static("chatgpt-account-id"), value);
+        }
+    }
+
+    if protocols.browser_credential.is_none() {
+        out.insert(
+            header::AUTHORIZATION,
+            authorization(inbound, profile, selection.credential)?,
+        );
+    }
+    if let Some(value) = &protocols.upstream_header {
+        out.insert(header::SEC_WEBSOCKET_PROTOCOL, value.clone());
+    }
+
+    Ok(WebSocketHeaders {
+        headers: out,
+        protocols,
+    })
+}
+
 pub fn response_headers(upstream: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for name in upstream.keys() {
@@ -98,6 +165,64 @@ pub fn response_headers(upstream: &HeaderMap) -> HeaderMap {
         }
     }
     out
+}
+
+pub fn websocket_response_headers(upstream: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for name in upstream.keys() {
+        let normalized = name.as_str();
+        if WEBSOCKET_RESPONSE_HEADER_ALLOWLIST.contains(&normalized)
+            || normalized.starts_with("x-ratelimit-")
+        {
+            for value in upstream.get_all(name).iter() {
+                out.append(name.clone(), value.clone());
+            }
+        }
+    }
+    out
+}
+
+fn reject_websocket_singletons(inbound: &HeaderMap, dialect: ApiDialect) -> Result<(), RelayError> {
+    for name in [
+        "origin",
+        "openai-organization",
+        "openai-project",
+        "openai-safety-identifier",
+        "openai-alpha",
+        "x-oai-attestation",
+    ] {
+        if name == "x-oai-attestation" && dialect == ApiDialect::OfficialGa {
+            continue;
+        }
+        if inbound.get_all(name).iter().count() > 1 {
+            return Err(RelayError::InvalidRealtimeHeader);
+        }
+    }
+    if inbound.get_all(header::AUTHORIZATION).iter().count() > 1 {
+        return Err(RelayError::AmbiguousAuthorization);
+    }
+    Ok(())
+}
+
+fn validate_websocket_metadata(inbound: &HeaderMap) -> Result<(), RelayError> {
+    for name in [
+        "origin",
+        "openai-organization",
+        "openai-project",
+        "openai-safety-identifier",
+        "openai-alpha",
+        "x-oai-attestation",
+        "openai-beta",
+    ] {
+        if inbound
+            .get_all(name)
+            .iter()
+            .any(|value| value.to_str().is_err())
+        {
+            return Err(RelayError::InvalidRealtimeHeader);
+        }
+    }
+    Ok(())
 }
 
 fn reject_duplicate_singletons(client: &HeaderMap, dialect: ApiDialect) -> Result<(), RelayError> {
@@ -590,6 +715,233 @@ mod tests {
                 ("retry-after".into(), "4".into(), false),
                 ("x-ratelimit-future-window".into(), "30".into(), false),
                 ("x-ratelimit-limit-requests".into(), "100".into(), false),
+                ("x-request-id".into(), "req_1".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn websocket_browser_credential_wins_without_authorization() {
+        let inbound = headers(&[
+            ("origin", "https://app.test"),
+            ("openai-beta", "realtime=v1"),
+            (
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.browser-secret",
+            ),
+            ("cookie", "must-not-cross"),
+            ("host", "downstream.test"),
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-key", "must-not-cross"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-extensions", "permessage-deflate"),
+        ]);
+        let built = upstream_websocket_headers(
+            &inbound,
+            &profile("managed-must-not-cross"),
+            &selected(ApiDialect::OfficialGa, CredentialPolicy::Managed),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            flattened(&built.headers),
+            vec![
+                ("openai-beta".into(), "realtime=v1".into(), false),
+                ("origin".into(), "https://app.test".into(), false),
+                (
+                    "sec-websocket-protocol".into(),
+                    "realtime, openai-insecure-api-key.browser-secret".into(),
+                    true,
+                ),
+            ]
+        );
+        assert!(!built.headers.contains_key(header::AUTHORIZATION));
+        assert!(built.protocols.browser_credential.is_some());
+        assert!(!format!("{:?}", built.headers).contains("browser-secret"));
+        assert!(!format!("{:?}", built.headers).contains("managed-must-not-cross"));
+    }
+
+    #[test]
+    fn websocket_header_and_browser_auth_domains_are_unambiguous() {
+        let browser = (
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.browser",
+        );
+        for authorization in ["Bearer caller", ""] {
+            assert!(matches!(
+                upstream_websocket_headers(
+                    &headers(&[browser, ("authorization", authorization)]),
+                    &profile("managed"),
+                    &selected(ApiDialect::OfficialGa, CredentialPolicy::Managed),
+                    None,
+                ),
+                Err(RelayError::InvalidRealtimeSubprotocol)
+            ));
+        }
+
+        for (protocol, header_name) in [
+            ("realtime, openai-organization.org_1", "openai-organization"),
+            ("realtime, openai-project.proj_1", "openai-project"),
+        ] {
+            assert!(matches!(
+                upstream_websocket_headers(
+                    &headers(&[
+                        ("sec-websocket-protocol", protocol),
+                        (header_name, "header-value"),
+                    ]),
+                    &profile("managed"),
+                    &selected(ApiDialect::OfficialGa, CredentialPolicy::Managed),
+                    None,
+                ),
+                Err(RelayError::InvalidRealtimeSubprotocol)
+            ));
+        }
+    }
+
+    #[test]
+    fn websocket_browser_protocols_are_official_only() {
+        for dialect in [ApiDialect::QuicksilverV1, ApiDialect::Frameless] {
+            for protocol in [
+                "realtime",
+                "realtime, openai-insecure-api-key.private-secret",
+                "realtime, openai-organization.org_1",
+                "realtime, openai-project.proj_1",
+            ] {
+                assert!(matches!(
+                    upstream_websocket_headers(
+                        &headers(&[("sec-websocket-protocol", protocol)]),
+                        &profile("managed"),
+                        &selected(dialect, CredentialPolicy::Managed),
+                        None,
+                    ),
+                    Err(RelayError::InvalidRealtimeSubprotocol)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn websocket_metadata_singletons_and_utf8_are_strict() {
+        for name in [
+            "origin",
+            "openai-organization",
+            "openai-project",
+            "openai-safety-identifier",
+        ] {
+            let mut repeated = HeaderMap::new();
+            repeated.append(name, HeaderValue::from_static("first"));
+            repeated.append(name, HeaderValue::from_static("second"));
+            assert!(matches!(
+                upstream_websocket_headers(
+                    &repeated,
+                    &profile("managed"),
+                    &selected(ApiDialect::OfficialGa, CredentialPolicy::Managed),
+                    None,
+                ),
+                Err(RelayError::InvalidRealtimeHeader)
+            ));
+
+            let mut non_utf8 = HeaderMap::new();
+            non_utf8.insert(name, HeaderValue::from_bytes(&[0xff]).unwrap());
+            assert!(matches!(
+                upstream_websocket_headers(
+                    &non_utf8,
+                    &profile("managed"),
+                    &selected(ApiDialect::OfficialGa, CredentialPolicy::Managed),
+                    None,
+                ),
+                Err(RelayError::InvalidRealtimeHeader)
+            ));
+        }
+
+        let mut beta = HeaderMap::new();
+        beta.append("openai-beta", HeaderValue::from_static("one"));
+        beta.append("openai-beta", HeaderValue::from_static(""));
+        beta.append("openai-beta", HeaderValue::from_static("two"));
+        let built = upstream_websocket_headers(
+            &beta,
+            &profile("managed"),
+            &selected(ApiDialect::OfficialGa, CredentialPolicy::Managed),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            built
+                .headers
+                .get_all("openai-beta")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn websocket_managed_and_client_bearers_follow_the_selected_policy() {
+        let managed = upstream_websocket_headers(
+            &headers(&[("authorization", "Bearer ignored-caller")]),
+            &profile("managed-secret"),
+            &selected(ApiDialect::OfficialGa, CredentialPolicy::Managed),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            managed.headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer managed-secret"
+        );
+        assert!(managed
+            .headers
+            .get(header::AUTHORIZATION)
+            .unwrap()
+            .is_sensitive());
+
+        let client_profile = UpstreamProfile::ApiKeyClient {
+            base_url: "https://api.openai.com/v1".into(),
+        };
+        let client = upstream_websocket_headers(
+            &headers(&[("authorization", "Bearer caller-secret")]),
+            &client_profile,
+            &selected(ApiDialect::OfficialGa, CredentialPolicy::ClientBearer),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            client.headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer caller-secret"
+        );
+        assert!(matches!(
+            upstream_websocket_headers(
+                &HeaderMap::new(),
+                &client_profile,
+                &selected(ApiDialect::OfficialGa, CredentialPolicy::ClientBearer),
+                None,
+            ),
+            Err(RelayError::NoCredential)
+        ));
+    }
+
+    #[test]
+    fn websocket_response_map_excludes_handshake_owned_headers() {
+        let upstream = headers(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-accept", "secret"),
+            ("sec-websocket-protocol", "realtime"),
+            ("content-type", "text/plain"),
+            ("retry-after", "2"),
+            ("x-request-id", "req_1"),
+            ("openai-processing-ms", "7"),
+            ("openai-version", "2026-07-01"),
+            ("x-ratelimit-future", "9"),
+        ]);
+        assert_eq!(
+            flattened(&websocket_response_headers(&upstream)),
+            vec![
+                ("openai-processing-ms".into(), "7".into(), false),
+                ("openai-version".into(), "2026-07-01".into(), false),
+                ("x-ratelimit-future".into(), "9".into(), false),
                 ("x-request-id".into(), "req_1".into(), false),
             ]
         );

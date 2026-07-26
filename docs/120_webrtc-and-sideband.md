@@ -31,17 +31,21 @@ Consume `ProtocolSelection` for private routes. Remove the `keyed` shortcut that
 currently sends every API-key profile to AVAS. Keep multipart→backend JSON and
 top-level ID removal only for the body the proxy rebuilds.
 
-### MODIFY `src/realtime/websocket.rs` and private sideband adapter
+### VERIFY `src/realtime/websocket.rs` and private sideband adapter
 
-Official GA sideband is exactly `/v1/realtime?call_id=...`; V1 alone adds
-Quicksilver intent; Frameless uses `/v1/live/{id}`. Returned `Location` remains
-opaque downstream, while tests extract its call ID and prove a following join.
+`110` already owns the standalone/existing-call dispatcher and both public and
+private pump policies: official GA sideband is exactly
+`/v1/realtime?call_id=...`, V1 alone adds Quicksilver intent, and Frameless uses
+`/v1/live/{id}`. This phase does not reimplement those paths. Returned
+`Location` remains opaque downstream, while the new end-to-end test extracts
+its call ID and proves the `100` call-create result composes with the `110`
+join.
 
 ### MODIFY `tests/call_create.rs`, `tests/sideband.rs`
 
-Correct false-confidence expectations: API-key Frameless direct URL and GA
-sideband query must assert source-authoritative paths. Retain private regression
-coverage.
+Correct remaining call-create false-confidence expectations and retain the
+`110` sideband regressions. Do not move alpha-free GA query ownership back into
+the private adapter.
 
 ### NEW `tests/official_webrtc.rs`
 

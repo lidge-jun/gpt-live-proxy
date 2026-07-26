@@ -127,17 +127,19 @@ WP1 exports classification and tests it but does not register a new endpoint.
 | `POST /v1/realtime/calls`, multipart, no private alpha | official WebRTC, opaque session, configured managed/client policy |
 | same, `application/sdp` | official WebRTC, opaque session, `Ephemeral` |
 | same, known private alpha | matching private WebRTC, opaque session, `Managed`; client mode is a contract error |
-| `GET /v1/realtime`, exactly one `model`, no `call_id` | official standalone WS, Realtime session, configured managed/client policy |
-| same, exactly one `call_id`, no `model` | official existing-call WS, opaque session, configured managed/client policy |
-| same with both, neither, or duplicate selector keys | `ContractError::AmbiguousQuery` or `MissingSelector` |
+| `GET /v1/realtime`, no `call_id`, exactly one non-empty `model` | official standalone WS, Realtime session, configured managed/client policy |
+| same, exactly one valid `call_id`, with zero or more `model` values | official existing-call WS, opaque session, configured managed/client policy; `model` is ignored by the upstream |
+| same with neither selector, duplicate `call_id`, or duplicate/empty standalone `model` | `ContractError::AmbiguousQuery`, `MissingSelector`, or `InvalidCallId` |
 | `GET /v1/realtime/translations`, exactly one `model` | official translation WS, Translation session, configured managed/client policy |
 | translation path with `call_id`, missing/duplicate `model`, or private alpha | contract error |
 | exact future REST bootstrap/control path with `POST` | official `Http` with Realtime, Transcription, Translation, or Opaque kind according to `080` |
 | wrong method, malformed content type, unknown path | `MethodNotAllowed`, `UnsupportedContentType`, or `UnknownRoute` |
 
 Ordered query input preserves duplicates for rejection. Query values are not
-decoded a second time; a sole empty/whitespace selector is `MissingSelector`,
-while both selector keys are ambiguous even if one is empty. Tests fire every
+decoded a second time. A sole empty/whitespace standalone selector is
+`MissingSelector`. One valid `call_id` takes precedence over every `model`
+value because the official server-side controls contract says `model` is
+ignored when joining an existing call. Tests fire every
 row, both credential modes, exact
 private values, an unknown alpha, selector order permutations, and cap-adjacent
 call IDs where applicable. Exact call-control segment validation remains owned

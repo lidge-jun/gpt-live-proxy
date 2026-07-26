@@ -1,23 +1,9 @@
 //! Opt-in, metadata-only sideband frame forensics.
 //!
-//! This exists to attribute multibyte corruption — was the replacement
-//! character already in the upstream frame, or did the relay introduce it? —
-//! without becoming a transcript recorder. The record carries direction, kind,
-//! byte length, and a U+FFFD flag. A payload excerpt appears only when a
-//! replacement character is present, and only around it.
-//!
-//! # What this does NOT guarantee
-//!
-//! The excerpt is *bounded*, not *empty*. For a corrupted frame it contains up
-//! to [`CONTEXT_CHARS`] scalars on each side of the replacement character, and
-//! for a frame shorter than that window the excerpt is the whole frame. If a
-//! secret sits adjacent to the corruption, that secret is in the excerpt.
-//!
-//! This is a deliberate trade, not an oversight: an excerpt that omitted the
-//! surrounding bytes could not attribute corruption at all, which is the only
-//! reason the log exists. The mitigations are that it is opt-in, that a clean
-//! frame produces no excerpt whatsoever, and that the operator is told to treat
-//! the file as sensitive and write it outside the working tree.
+//! This attributes multibyte corruption without becoming a transcript recorder.
+//! Records contain direction, frame kind, byte length, a U+FFFD/UTF-8-fault
+//! flag, and optionally the byte offset of the first fault. They never contain
+//! text, binary bytes, close reasons, protocol values, excerpts, or hashes.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -30,9 +16,6 @@ use serde::Serialize;
 /// so an existing diagnostic workflow keeps working (docs/002 D6).
 pub const FRAME_LOG_ENV: &str = "GPT_LIVE_FRAME_LOG";
 pub const FRAME_LOG_ENV_ALIAS: &str = "OCX_LIVE_FRAME_LOG";
-
-/// Unicode scalar values retained on each side of the first U+FFFD.
-pub const CONTEXT_CHARS: usize = 24;
 
 /// The replacement character whose presence is the whole point of this log.
 const REPLACEMENT: char = '\u{FFFD}';
@@ -77,7 +60,7 @@ pub struct FrameRecord {
     pub bytes: usize,
     pub fffd: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
+    pub fault_byte_offset: Option<usize>,
 }
 
 /// Inert unless a path is configured.
@@ -216,31 +199,31 @@ impl FrameLogger {
 
     /// Build the record for a text frame without writing it.
     pub fn text_record(&self, dir: Direction, text: &str) -> FrameRecord {
-        let context = fffd_context(text);
+        let fault_byte_offset = text.find(REPLACEMENT);
         FrameRecord {
             ts: timestamp(),
             dir: dir.as_str(),
             kind: FrameKind::Text.as_str(),
             bytes: text.len(),
-            fffd: context.is_some(),
-            context,
+            fffd: fault_byte_offset.is_some(),
+            fault_byte_offset,
         }
     }
 
     /// Build the record for a binary frame without writing it.
     ///
-    /// The payload is decoded ONLY to detect a replacement character; the
-    /// decoded form never feeds back into the relayed frame, and the reported
-    /// length is always the raw byte count.
+    /// The payload is inspected only to find the first literal replacement
+    /// character or invalid UTF-8 byte. It is never retained or decoded into a
+    /// log field, and the reported length is always the raw byte count.
     pub fn binary_record(&self, dir: Direction, bytes: &[u8]) -> FrameRecord {
-        let context = binary_context(bytes);
+        let fault_byte_offset = first_fault_byte(bytes);
         FrameRecord {
             ts: timestamp(),
             dir: dir.as_str(),
             kind: FrameKind::Binary.as_str(),
             bytes: bytes.len(),
-            fffd: context.is_some(),
-            context,
+            fffd: fault_byte_offset.is_some(),
+            fault_byte_offset,
         }
     }
 
@@ -311,70 +294,17 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Detect corruption in a binary frame without decoding the whole thing.
-///
-/// A lossy decode of the entire payload would allocate up to three times its
-/// size just to produce a 49-scalar excerpt, so this finds the first invalid
-/// sequence and decodes only a bounded window around it. A frame that is valid
-/// UTF-8 is inspected for a literal replacement character in the same bounded
-/// way.
-fn binary_context(bytes: &[u8]) -> Option<String> {
-    // A generous byte window: enough to yield CONTEXT_CHARS scalars on each
-    // side even for 4-byte characters.
-    const WINDOW: usize = CONTEXT_CHARS * 4;
-
-    let error_at = match std::str::from_utf8(bytes) {
-        Ok(text) => return fffd_context(text),
-        Err(err) => err.valid_up_to(),
-    };
-
-    // The prefix up to `error_at` is known-valid UTF-8. If it ALREADY contains
-    // a literal replacement character, that one is the first occurrence in the
-    // conceptual lossy decode, so centre on it rather than on the later invalid
-    // sequence — otherwise the "first occurrence" rule would silently depend on
-    // whether the corruption was literal or malformed.
-    let valid_prefix = std::str::from_utf8(&bytes[..error_at]).unwrap_or("");
-    if let Some(context) = fffd_context(valid_prefix) {
-        return Some(context);
-    }
-
-    // Window start chosen from the prefix's char boundaries: slicing at a raw
-    // byte offset could split a character and manufacture a replacement
-    // character that the excerpt would then centre on.
-    let mut start = error_at;
-    for (index, _) in valid_prefix.char_indices().rev() {
-        if error_at - index > WINDOW {
-            break;
+/// Return the byte position of the first literal U+FFFD or malformed UTF-8
+/// sequence, whichever occurs first, without allocating a payload copy.
+fn first_fault_byte(bytes: &[u8]) -> Option<usize> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.find(REPLACEMENT),
+        Err(error) => {
+            let invalid_at = error.valid_up_to();
+            let valid_prefix = std::str::from_utf8(&bytes[..invalid_at]).unwrap_or("");
+            valid_prefix.find(REPLACEMENT).or(Some(invalid_at))
         }
-        start = index;
     }
-
-    let end = bytes.len().min(error_at.saturating_add(WINDOW));
-    let decoded = String::from_utf8_lossy(&bytes[start..end]);
-    fffd_context(&decoded)
-}
-
-/// A bounded excerpt around the first replacement character, or `None`.
-///
-/// Bounded in Unicode scalar values with char-boundary clamping. The
-/// TypeScript original slices UTF-16 code units with an exclusive end (up to 24
-/// before, at most 23 after); the invariant preserved here is a *bounded*
-/// excerpt, not the exact unit count (docs/001 §8).
-///
-/// "Bounded" is the whole claim. A frame shorter than the window yields the
-/// whole frame — see the module docs.
-fn fffd_context(text: &str) -> Option<String> {
-    let index = text.find(REPLACEMENT)?;
-    let before: String = text[..index]
-        .chars()
-        .rev()
-        .take(CONTEXT_CHARS)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let after: String = text[index..].chars().take(CONTEXT_CHARS + 1).collect();
-    Some(format!("{before}{after}"))
 }
 
 #[cfg(test)]
@@ -425,7 +355,7 @@ mod tests {
         assert_eq!(record.kind, "text");
         assert!(!record.fffd);
         assert!(
-            record.context.is_none(),
+            record.fault_byte_offset.is_none(),
             "a clean frame must carry no payload"
         );
         // Byte length, not character count.
@@ -433,38 +363,21 @@ mod tests {
     }
 
     #[test]
-    fn a_replacement_character_yields_a_bounded_excerpt() {
+    fn a_replacement_character_yields_only_its_byte_offset() {
         let logger = FrameLogger::disabled();
-        let payload = format!("{}\u{FFFD}{}", "a".repeat(500), "b".repeat(500));
+        let payload = format!("{}\u{FFFD}adjacent-secret", "한".repeat(10));
         let record = logger.text_record(Direction::UpstreamToClient, &payload);
 
         assert!(record.fffd);
-        let context = record.context.expect("an excerpt");
-        // Never the full payload.
-        assert!(
-            context.len() < payload.len() / 10,
-            "excerpt too long: {context}"
-        );
-        assert!(context.contains(REPLACEMENT));
-        assert_eq!(context.chars().filter(|c| *c == 'a').count(), CONTEXT_CHARS);
-        assert_eq!(context.chars().filter(|c| *c == 'b').count(), CONTEXT_CHARS);
+        assert_eq!(record.fault_byte_offset, Some("한".len() * 10));
     }
 
     #[test]
-    fn the_excerpt_clamps_to_char_boundaries() {
+    fn a_multibyte_prefix_reports_a_byte_not_scalar_offset() {
         let logger = FrameLogger::disabled();
-        // Multibyte on both sides: a byte-indexed slice would panic here.
-        let payload = format!("{}\u{FFFD}{}", "한".repeat(100), "글".repeat(100));
-        let record = logger.text_record(Direction::ClientToUpstream, &payload);
-        let context = record.context.expect("an excerpt");
-        assert!(context.chars().count() <= CONTEXT_CHARS * 2 + 1);
-    }
-
-    #[test]
-    fn a_short_payload_is_not_padded() {
-        let logger = FrameLogger::disabled();
-        let record = logger.text_record(Direction::ClientToUpstream, "a\u{FFFD}b");
-        assert_eq!(record.context.unwrap(), "a\u{FFFD}b");
+        let payload = "한글\u{FFFD}tail";
+        let record = logger.text_record(Direction::ClientToUpstream, payload);
+        assert_eq!(record.fault_byte_offset, Some("한글".len()));
     }
 
     #[test]
@@ -478,31 +391,19 @@ mod tests {
             "the raw byte count, not the decoded length"
         );
         assert!(record.fffd);
+        assert_eq!(record.fault_byte_offset, Some(1));
     }
 
-    /// The window start must land on a character boundary of the known-valid
-    /// prefix. Slicing at a raw byte offset could split a multi-byte character
-    /// and manufacture a replacement character at the slice start, and the
-    /// excerpt would then centre on that artefact instead of the real
-    /// corruption.
     #[test]
-    fn the_binary_window_does_not_manufacture_corruption() {
+    fn invalid_binary_after_multibyte_text_reports_the_exact_byte() {
         let logger = FrameLogger::disabled();
-        // Multibyte filler well past the window, then the real corruption.
         let mut payload = "한".repeat(400).into_bytes();
+        let expected = payload.len();
         payload.push(0xff);
-        payload.extend_from_slice("tail".as_bytes());
 
         let record = logger.binary_record(Direction::UpstreamToClient, &payload);
         assert!(record.fffd);
-        let context = record.context.expect("an excerpt");
-
-        // The excerpt must show the corruption in its true surroundings.
-        assert!(
-            context.contains("tail"),
-            "the excerpt missed the real corruption site: {context}"
-        );
-        assert!(context.chars().count() <= CONTEXT_CHARS * 2 + 1);
+        assert_eq!(record.fault_byte_offset, Some(expected));
         assert_eq!(record.bytes, payload.len());
     }
 
@@ -516,11 +417,7 @@ mod tests {
 
         let record = logger.binary_record(Direction::UpstreamToClient, &payload);
         assert!(record.fffd);
-        let context = record.context.expect("an excerpt");
-        assert!(
-            context.contains("head") && context.contains("marker"),
-            "the excerpt centred on the wrong occurrence: {context}"
-        );
+        assert_eq!(record.fault_byte_offset, Some("head".len()));
     }
 
     #[test]
@@ -537,7 +434,7 @@ mod tests {
         let logger = FrameLogger::disabled();
         let record = logger.binary_record(Direction::ClientToUpstream, "ok".as_bytes());
         assert!(!record.fffd);
-        assert!(record.context.is_none());
+        assert!(record.fault_byte_offset.is_none());
     }
 
     #[test]
@@ -551,8 +448,12 @@ mod tests {
         assert_eq!(value["bytes"], 5);
         assert_eq!(value["fffd"], false);
         assert!(
-            value.as_object().unwrap().get("context").is_none(),
-            "context must be absent, not null"
+            value
+                .as_object()
+                .unwrap()
+                .get("fault_byte_offset")
+                .is_none(),
+            "fault_byte_offset must be absent, not null"
         );
     }
 

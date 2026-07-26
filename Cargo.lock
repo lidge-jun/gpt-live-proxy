@@ -445,6 +445,7 @@ dependencies = [
  "futures-util",
  "http",
  "hyper",
+ "log",
  "multer",
  "percent-encoding",
  "reqwest",
@@ -457,6 +458,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 

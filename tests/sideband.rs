@@ -66,6 +66,10 @@ async fn start_ws_upstream() -> (String, Seen) {
 }
 
 async fn start_proxy(upstream_base: &str) -> String {
+    start_proxy_with(upstream_base, |_| {}).await
+}
+
+async fn start_proxy_with(upstream_base: &str, configure: impl FnOnce(&mut Config)) -> String {
     let mut config = Config::from_source(|k| match k {
         "GPT_LIVE_TOKEN" => Some("unused".to_string()),
         _ => None,
@@ -75,6 +79,7 @@ async fn start_proxy(upstream_base: &str) -> String {
         base_url: format!("{upstream_base}/v1"),
         auth: BearerToken::new("sk-test"),
     };
+    configure(&mut config);
 
     let listener = tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
         .await
@@ -119,7 +124,16 @@ async fn a_realtime_query_join_carries_the_intent_parameter() {
     let (upstream, seen) = start_ws_upstream().await;
     let proxy = start_proxy(&upstream).await;
 
-    let mut client = connect(&format!("{proxy}/v1/realtime?call_id=rtc_q")).await;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = format!("{proxy}/v1/realtime?call_id=rtc_q")
+        .into_client_request()
+        .expect("private query request");
+    request
+        .headers_mut()
+        .insert("openai-alpha", "quicksilver=v1".parse().unwrap());
+    let (mut client, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("private query upgrade");
     client
         .send(ClientMessage::Text("ping".into()))
         .await
@@ -564,6 +578,81 @@ async fn keepalives_do_not_consume_the_queue_budget() {
             _ => continue,
         }
     }
+}
+
+#[tokio::test]
+async fn queued_frames_are_bounded_by_aggregate_bytes_not_only_count() {
+    let held = start_held_upstream().await;
+    let proxy = start_proxy_with(&held.base, |config| {
+        config.limits.websocket_frame_bytes = 64;
+    })
+    .await;
+    let mut client = connect(&format!("{proxy}/v1/live/rtc_bytes")).await;
+
+    held.reached.await.expect("upstream handshake reached");
+    client
+        .send(ClientMessage::Text("a".repeat(40).into()))
+        .await
+        .expect("first queued frame");
+    client
+        .send(ClientMessage::Text("b".repeat(40).into()))
+        .await
+        .expect("aggregate-overflow frame");
+
+    while let Some(message) = client.next().await {
+        match message {
+            Ok(ClientMessage::Close(Some(frame))) => {
+                assert_eq!(u16::from(frame.code), 1009);
+                assert_eq!(frame.reason.as_str(), "queued frames too large");
+                let _ = held.release.send(());
+                return;
+            }
+            Ok(_) => continue,
+            Err(error) => panic!("expected aggregate-cap close, got {error:?}"),
+        }
+    }
+    let _ = held.release.send(());
+    panic!("aggregate queued-byte overflow did not close the connection");
+}
+
+#[tokio::test]
+async fn active_private_connection_permit_rejects_then_recovers() {
+    let held = start_held_upstream().await;
+    let proxy = start_proxy_with(&held.base, |config| {
+        config.limits.active_connections = 1;
+    })
+    .await;
+    let url = format!("{proxy}/v1/live/rtc_permit");
+    let mut first = connect(&url).await;
+    held.reached
+        .await
+        .expect("first upstream handshake reached");
+
+    match tokio_tungstenite::connect_async(&url).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        }
+        other => panic!("expected permit 429, got {other:?}"),
+    }
+
+    held.release.send(()).expect("release upstream");
+    first
+        .send(ClientMessage::Close(None))
+        .await
+        .expect("close first");
+    while let Some(message) = first.next().await {
+        if matches!(message, Ok(ClientMessage::Close(_)) | Err(_)) {
+            break;
+        }
+    }
+    tokio::task::yield_now().await;
+
+    // The original proxy remains configured to the first upstream, which has
+    // completed its one accepted connection. Reaching a local 101 here proves
+    // the permit was released; the later private upstream failure is separate.
+    let recovered = tokio_tungstenite::connect_async(&url).await;
+    assert!(recovered.is_ok(), "permit did not recover: {recovered:?}");
 }
 
 #[tokio::test]

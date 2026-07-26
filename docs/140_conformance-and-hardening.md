@@ -26,12 +26,12 @@ Black-box scenarios:
 The mock captures exact wire artifacts; the harness never contacts OpenAI and
 never prints credentials.
 
-### NEW `tests/fixtures/official/`
+### MODIFY/VERIFY `tests/fixtures/official/`
 
 Versioned fixture manifest records official source URL, fetch date, schema/event
-name, and SHA-256. Fixtures are not generated from Rust enums. Standard client
-and server event-name inventories include the current 11/46 sets; translation
-fixtures are separate.
+name, and SHA-256. `110` already owns the standard and translation WebSocket
+event-name inventory; this phase verifies its provenance and adds remaining
+HTTP/schema fixtures. Fixtures are not generated from Rust enums.
 
 ## Resource and egress hardening
 
@@ -39,8 +39,8 @@ fixtures are separate.
 
 - enforce request-read, response, WS connect, WS send, and idle deadlines;
 - bound request concurrency, active WebSockets, pre-open bytes, and frame bytes;
-- soak and mutation-check WP2's HTTP `429`/`Retry-After` permit contract; add
-  the corresponding WS permit behavior without creating a second HTTP owner;
+- soak and mutation-check WP2's HTTP and WP3's WebSocket
+  `429`/`Retry-After` permit contracts without creating second owners;
 - disable redirects and prove cross-host redirects never receive auth/body;
 - expose readiness separately from liveness if permit/drain state makes the
   service unable to accept work;
@@ -54,12 +54,14 @@ principal and says so at startup/README; it must not claim tenant isolation.
 
 ## Privacy
 
-### MODIFY `src/observability/frame_log.rs`, `docs/050_observability.md`
+### VERIFY `src/observability/frame_log.rs`, `src/observability/mod.rs`, `docs/050_observability.md`
 
-Remove the payload `context` excerpt. Record direction, kind, byte count,
-replacement/UTF-8 fault flag, fault offset, and a keyed or non-reversible digest
-only. Canary tests cover headers, HTTP bodies, text/binary frames, close reasons,
-and subprotocols. No test artifact may contain the canary.
+`110` already removes payload excerpts and hard-disables every
+tungstenite/tokio-tungstenite dependency target that can render handshake or
+frame payloads. Verify that metadata-only record and filter under
+adversarial EnvFilter directives; do not reintroduce excerpts or a reversible
+digest. Canary tests cover headers, HTTP bodies, text/binary frames, close
+reasons, and subprotocols. No test artifact may contain the canary.
 
 ## Test strength
 

@@ -15,6 +15,7 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Buffered upstream response cap (`GPT_LIVE_RESPONSE_MAX_BYTES`).
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_WEBSOCKET_FRAME_OVERHEAD: usize = 14;
 pub const MAX_ACTIVE_REQUESTS: usize = 128;
 pub const MAX_ACTIVE_CONNECTIONS: usize = 128;
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -308,6 +309,23 @@ fn positive_semaphore_permits(
     Ok(value)
 }
 
+fn positive_websocket_frame_bytes(
+    raw: Option<String>,
+    key: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    let value = positive_usize(raw, key, default)?;
+    if value > usize::MAX - MAX_WEBSOCKET_FRAME_OVERHEAD {
+        return Err(ConfigError::Invalid {
+            key,
+            reason: format!(
+                "must leave {MAX_WEBSOCKET_FRAME_OVERHEAD} bytes for WebSocket framing"
+            ),
+        });
+    }
+    Ok(value)
+}
+
 fn positive_millis(
     raw: Option<String>,
     key: &'static str,
@@ -438,7 +456,7 @@ impl Config {
                 "GPT_LIVE_RESPONSE_MAX_BYTES",
                 MAX_RESPONSE_BYTES,
             )?,
-            websocket_frame_bytes: positive_usize(
+            websocket_frame_bytes: positive_websocket_frame_bytes(
                 get("GPT_LIVE_WS_FRAME_MAX_BYTES"),
                 "GPT_LIVE_WS_FRAME_MAX_BYTES",
                 MAX_WEBSOCKET_FRAME_BYTES,
@@ -972,6 +990,42 @@ mod tests {
                     "{key}={too_large} returned {err}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn websocket_frame_limit_reserves_checked_protocol_overhead() {
+        let maximum = (usize::MAX - MAX_WEBSOCKET_FRAME_OVERHEAD).to_string();
+        let cfg = Config::from_source(|candidate| match candidate {
+            "GPT_LIVE_TOKEN" => Some("t".to_string()),
+            "GPT_LIVE_WS_FRAME_MAX_BYTES" => Some(maximum.clone()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            cfg.limits
+                .websocket_frame_bytes
+                .checked_add(MAX_WEBSOCKET_FRAME_OVERHEAD),
+            Some(usize::MAX)
+        );
+
+        for too_large in [
+            (usize::MAX - MAX_WEBSOCKET_FRAME_OVERHEAD + 1).to_string(),
+            usize::MAX.to_string(),
+        ] {
+            let error = Config::from_source(|candidate| match candidate {
+                "GPT_LIVE_TOKEN" => Some("t".to_string()),
+                "GPT_LIVE_WS_FRAME_MAX_BYTES" => Some(too_large.clone()),
+                _ => None,
+            })
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ConfigError::Invalid {
+                    key: "GPT_LIVE_WS_FRAME_MAX_BYTES",
+                    ..
+                }
+            ));
         }
     }
 }

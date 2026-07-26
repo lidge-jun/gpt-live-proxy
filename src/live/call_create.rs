@@ -218,7 +218,9 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestPath {
 fn finish_error(lifecycle: &ExchangeLifecycle, err: &RelayError) {
     let terminal = match err {
         RelayError::ClientCanceled => ExchangeTerminal::Canceled,
-        RelayError::UpstreamTimeout => ExchangeTerminal::TimedOut,
+        RelayError::RealtimeRequestBodyTimeout | RelayError::UpstreamTimeout => {
+            ExchangeTerminal::TimedOut
+        }
         _ => ExchangeTerminal::Failed,
     };
     lifecycle.finish(terminal);
@@ -323,6 +325,14 @@ mod tests {
             terminal_label(ExchangeTerminal::Canceled),
             "client_canceled"
         );
+    }
+
+    #[test]
+    fn request_read_timeout_records_the_timed_out_terminal() {
+        let (lifecycle, _guard) = begin_exchange();
+        finish_error(&lifecycle, &RelayError::RealtimeRequestBodyTimeout);
+        assert_eq!(lifecycle.terminal(), ExchangeTerminal::TimedOut);
+        assert_eq!(terminal_label(lifecycle.terminal()), "timed_out");
     }
 
     #[test]

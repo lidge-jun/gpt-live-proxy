@@ -127,7 +127,7 @@ use http::HeaderMap;
 use crate::app::AppState;
 use crate::error::RelayError;
 use crate::live::headers::merge_upstream_headers;
-use crate::relay::pump::run_pump;
+use crate::relay::pump::{run_private_pump, ClosePolicy, PumpPolicy, MAX_WEBSOCKET_FRAME_OVERHEAD};
 use crate::wire::{SidebandJoinStyle, WireAdapter};
 
 /// True when the request announces a WebSocket upgrade.
@@ -168,10 +168,28 @@ pub async fn handle_sideband(
     if !is_websocket_upgrade(&request_headers) {
         return unknown();
     }
+
+    // Browser credential subprotocols belong exclusively to the public GA
+    // surface. Reject them before taking a permit or contacting a private
+    // upstream, including on the historical path aliases.
+    match crate::realtime::subprotocol::parse(
+        &request_headers,
+        state.config.admission_token.as_ref(),
+    ) {
+        Ok(protocols) if protocols.offered.is_empty() => {}
+        Ok(_) => return RelayError::InvalidRealtimeSubprotocol.into_response(),
+        Err(error) => return error.into_response(),
+    }
+
+    let cap = state.config.limits.websocket_frame_bytes;
     let upgrade = match WebSocketUpgrade::from_request(request, &()).await {
         Ok(upgrade) => upgrade,
         Err(_) => return unknown(),
-    };
+    }
+    .write_buffer_size(0)
+    .max_write_buffer_size(cap + MAX_WEBSOCKET_FRAME_OVERHEAD)
+    .max_message_size(cap)
+    .max_frame_size(cap);
 
     let config = state.config.clone();
     let upstream_headers = match merge_upstream_headers(&request_headers, &config.upstream, None) {
@@ -207,6 +225,21 @@ pub async fn handle_sideband(
 
     // Service-owned: one writer for the whole process, cloned per upgrade.
     let frame_logger = state.frame_log.clone();
+    let permit = match state.active_connections.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return RelayError::TooManyActiveRealtimeConnections.into_response(),
+    };
+    let policy = PumpPolicy {
+        frame_bytes: cap,
+        send_timeout: state.config.limits.websocket_send_timeout,
+        close_policy: ClosePolicy::PrivateNormalized,
+    };
+    let connect_timeout = state.config.limits.websocket_connect_timeout;
+    let upstream_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .write_buffer_size(0)
+        .max_write_buffer_size(cap + MAX_WEBSOCKET_FRAME_OVERHEAD)
+        .max_message_size(Some(cap))
+        .max_frame_size(Some(cap));
 
     // Host only, parsed rather than split: the URL embeds the call id, and a
     // split would also expose any userinfo.
@@ -229,6 +262,7 @@ pub async fn handle_sideband(
         // suspends.
         use tracing::Instrument;
         async move {
+            let _permit = permit;
             let connect = async move {
                 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -241,16 +275,26 @@ pub async fn handle_sideband(
                 for (name, value) in upstream_headers.iter() {
                     request.headers_mut().insert(name.clone(), value.clone());
                 }
-                match tokio_tungstenite::connect_async(request).await {
-                    Ok((stream, _response)) => Ok(stream),
-                    Err(err) => Err(err.to_string()),
+                match tokio::time::timeout(
+                    connect_timeout,
+                    tokio_tungstenite::connect_async_with_config(
+                        request,
+                        Some(upstream_config),
+                        false,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok((stream, _response))) => Ok(stream),
+                    Ok(Err(_)) => Err("upstream handshake failed".to_string()),
+                    Err(_) => Err("upstream handshake timed out".to_string()),
                 }
             };
 
             // Logged before the pump runs, but described accurately: the upstream
             // handshake has not completed yet at this point.
             tracing::debug!("sideband downstream upgraded");
-            let outcome = run_pump(socket, connect, frame_logger).await;
+            let outcome = run_private_pump(socket, connect, policy, frame_logger).await;
             // Kind and code only: `?outcome` would render the peer-controlled close
             // reason, which can carry transcript text or a credential.
             let span = tracing::Span::current();

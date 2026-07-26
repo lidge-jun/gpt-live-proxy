@@ -43,8 +43,12 @@ fn a_clean_transcript_never_reaches_the_log() {
 
     assert_eq!(record["fffd"], false);
     assert!(
-        record.as_object().unwrap().get("context").is_none(),
-        "a clean frame must carry no excerpt at all"
+        record
+            .as_object()
+            .unwrap()
+            .get("fault_byte_offset")
+            .is_none(),
+        "a clean frame must carry no fault offset"
     );
 
     // The decisive assertion: none of the payload is anywhere in the file.
@@ -56,63 +60,53 @@ fn a_clean_transcript_never_reaches_the_log() {
 }
 
 #[test]
-fn a_corrupted_frame_logs_a_bounded_excerpt_not_the_payload() {
+fn a_corrupted_text_frame_logs_only_metadata_even_next_to_a_credential() {
     let path = temp_path("corrupt.jsonl");
     let logger = FrameLogger::new(&path);
 
-    let prefix = "머리말".repeat(200);
-    let suffix = "꼬리말".repeat(200);
-    let payload = format!("{prefix}\u{FFFD}{suffix}");
+    let prefix = "머리말".repeat(20);
+    let canary = "Bearer adjacent-text-credential-canary";
+    let payload = format!("{prefix}\u{FFFD}{canary}");
     logger.log_text(Direction::UpstreamToClient, &payload);
 
     let records = read_records(&path);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["fffd"], true);
-    let context = records[0]["context"].as_str().expect("an excerpt");
-
-    assert!(context.contains('\u{FFFD}'));
-    // Bounded: an excerpt, not a copy.
-    assert!(
-        context.chars().count() <= 49,
-        "excerpt exceeded its bound: {} chars",
-        context.chars().count()
+    assert_eq!(
+        records[0]["fault_byte_offset"],
+        serde_json::json!(prefix.len())
     );
-    assert!(context.len() < payload.len() / 10);
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    for forbidden in [
+        "머리말",
+        "\u{FFFD}",
+        canary,
+        "adjacent-text-credential-canary",
+    ] {
+        assert!(!raw.contains(forbidden), "frame payload leaked: {raw}");
+    }
+    assert!(records[0].as_object().unwrap().get("context").is_none());
 
     let _ = std::fs::remove_file(&path);
 }
 
-/// The guarantee is a BOUNDED excerpt, not an empty one.
-///
-/// A token far enough from the corruption is outside the window; a token
-/// adjacent to it is not. Both are asserted, so the documented trade is pinned
-/// by a test rather than by prose alone.
 #[test]
-fn the_excerpt_window_is_bounded_but_not_empty() {
+fn adjacent_text_payload_is_never_serialized() {
     let path = temp_path("credentials.jsonl");
     let logger = FrameLogger::new(&path);
 
-    // Far from the corruption: outside the window.
     logger.log_text(
         Direction::ClientToUpstream,
-        "Bearer sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 ................................ \u{FFFD} tail",
+        "openai-insecure-api-key.adjacent-browser-canary\u{FFFD}",
     );
     let raw = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !raw.contains("sk-proj-abcdefghijklmnopqrstuvwxyz"),
-        "text beyond the window must not be logged: {raw}"
+        !raw.contains("adjacent-browser-canary"),
+        "adjacent credential leaked: {raw}"
     );
-
-    // Adjacent to the corruption: inside the window, by design. If this ever
-    // stops being true, docs/050 and the module docs must change with it.
-    let _ = std::fs::remove_file(&path);
-    let logger = FrameLogger::new(&path);
-    logger.log_text(Direction::ClientToUpstream, "tok-abc\u{FFFD}");
-    let raw = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        raw.contains("tok-abc"),
-        "the documented trade is that adjacent text IS captured: {raw}"
-    );
+    assert!(!raw.contains("openai-insecure-api-key"));
+    assert!(!raw.contains("context"));
 
     let _ = std::fs::remove_file(&path);
 }
@@ -131,22 +125,25 @@ fn an_append_failure_is_not_fatal() {
 }
 
 #[test]
-fn binary_frames_report_raw_length_and_are_never_transcribed() {
+fn binary_frames_report_raw_length_and_never_serialize_adjacent_bytes() {
     let path = temp_path("binary.jsonl");
     let logger = FrameLogger::new(&path);
 
-    // Audio-shaped bytes: invalid UTF-8, so lossy decoding flags corruption.
-    let payload: Vec<u8> = (0u8..=255).collect();
+    let mut payload = b"binary-credential-canary".to_vec();
+    let fault_at = payload.len();
+    payload.push(0xff);
+    payload.extend_from_slice(b"adjacent-binary-secret");
     logger.log_binary(Direction::UpstreamToClient, &payload);
 
     let records = read_records(&path);
     assert_eq!(records[0]["kind"], "binary");
-    assert_eq!(records[0]["bytes"], 256);
+    assert_eq!(records[0]["bytes"], payload.len());
+    assert_eq!(records[0]["fault_byte_offset"], fault_at);
 
-    // Whatever excerpt exists must be tiny relative to the payload.
-    if let Some(context) = records[0]["context"].as_str() {
-        assert!(context.chars().count() <= 49);
-    }
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("binary-credential-canary"));
+    assert!(!raw.contains("adjacent-binary-secret"));
+    assert!(!raw.contains("context"));
 
     let _ = std::fs::remove_file(&path);
 }

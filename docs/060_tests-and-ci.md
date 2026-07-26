@@ -61,8 +61,10 @@ layout simply differs from the plan.
 `forensics.rs`
 
 - A clean transcript writing no payload at all.
-- A corrupted frame writing a bounded excerpt, and the documented trade that
-  adjacent text *is* captured.
+- Text/binary corruption recording only a first fault byte offset; adjacent
+  credential canaries and the removed `context` field are absent.
+- A hostile global trace directive cannot re-enable tungstenite handshake,
+  protocol, frame-payload, or close targets.
 - An append failure being non-fatal, both directly and mid-relay.
 - A live relay logging both directions and excluding keepalives, mutation-checked.
 - The span contract for call-create and sideband, asserted against the isolated

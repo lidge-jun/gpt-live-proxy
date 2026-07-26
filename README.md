@@ -129,19 +129,19 @@ It exists to answer one question: when a transcript shows U+FFFD (the Unicode
 replacement character) - was it already in the upstream frame, or did the relay
 introduce it?
 
-A clean frame records no payload at all. A corrupted one adds a `context` field:
-a bounded excerpt around the first replacement character.
+A clean frame records no payload at all. A corrupted frame adds only
+`fault_byte_offset`, the first replacement/invalid-UTF-8 byte position. It never
+records an excerpt, payload bytes, a reversible digest, a protocol value, or a
+close reason.
 
 Records are written by a background thread and are **dropped** rather than
 queued indefinitely if that thread falls behind, or if the write fails. Stalling
 a voice call to guarantee a diagnostic line would be the wrong trade, so the log
 is best-effort by design.
 
-**Bounded is not empty.** The excerpt spans at most 24 scalars on each side, and
-a frame shorter than that window is captured whole. If a secret sits next to the
-corruption, it is in the excerpt. That is a deliberate trade — an excerpt
-without its surroundings could not attribute anything — so treat the file as
-sensitive and write it outside the working tree.
+Even a secret immediately adjacent to U+FFFD is absent from the JSONL record.
+The file still contains timing, direction, frame type, and byte-count metadata,
+so write it outside the working tree and enable it only for diagnostics.
 
 ## Quickstart
 

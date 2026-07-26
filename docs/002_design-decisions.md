@@ -85,11 +85,21 @@ Three independent mechanisms, because a newtype alone is not enough:
 
 1. `BearerToken`'s `Debug` prints `Bearer <redacted>`, protecting config-level `{:?}`.
 2. Once a token becomes an `authorization` value inside a `HeaderMap`, the newtype no longer protects it — so every credential-bearing header value is constructed with `HeaderValue::set_sensitive(true)`, and **logging a whole `HeaderMap` is prohibited**. A helper `redacted_headers(&HeaderMap)` is the only sanctioned way to render headers, and it replaces the value of any sensitive or known-credential header with `<redacted>`.
-3. The frame-forensics writer records only direction, kind, byte length, a U+FFFD flag, and — solely when a replacement character is present — a bounded excerpt.
+3. The frame-forensics writer records only direction, kind, byte length, a
+   U+FFFD/UTF-8 fault flag, and the first fault byte offset. It never records an
+   excerpt, payload, reversible digest, protocol value, or close reason.
+4. A hard tracing-layer filter disables every tungstenite/tokio-tungstenite
+   dependency target even when a user EnvFilter explicitly requests it, because
+   those targets serialize handshake credentials, text/binary frames, and close
+   reasons before sensitive-value redaction can apply.
 
 Config accepts secrets from the environment only; no file in the repository contains a real token shape.
 
-**Scope of this guarantee.** It covers *credentials the relay handles*: bearer tokens, account identifiers, and the admission secret. It does not extend to arbitrary text a client chooses to put inside a WebSocket frame. If a caller writes a token into frame content and that content is corrupted, the opt-in frame log can capture it in the bounded excerpt around the corruption — see `050` for the precise statement. The three layers above make it impossible for the relay to leak a credential it manages; they cannot make it impossible for a client to leak its own.
+**Scope of this guarantee.** It covers managed credentials, browser
+subprotocol credentials, account identifiers, the admission secret, and
+arbitrary frame payload content handled by the relay's own diagnostics. A peer
+or external dependency can still exfiltrate data outside this process; `050`
+defines the exact local record boundary.
 
 ## D6. Environment variable naming
 

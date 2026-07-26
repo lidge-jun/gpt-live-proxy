@@ -19,6 +19,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
     pub active_requests: Arc<Semaphore>,
+    pub active_connections: Arc<Semaphore>,
     pub drain: DrainState,
     /// Service-owned so shutdown can flush it and so tests can inject one.
     pub frame_log: crate::observability::FrameLogger,
@@ -29,6 +30,7 @@ impl AppState {
     /// initialization; startup reports that rather than panicking.
     pub fn new(config: Config) -> Result<Self, reqwest::Error> {
         let active_requests = Arc::new(Semaphore::new(config.limits.active_requests));
+        let active_connections = Arc::new(Semaphore::new(config.limits.active_connections));
         Ok(Self {
             config: Arc::new(config),
             // The relay owns its own timeouts per request, so the client carries none.
@@ -39,6 +41,7 @@ impl AppState {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             active_requests,
+            active_connections,
             drain: DrainState::new(),
             frame_log: crate::observability::FrameLogger::from_env_owned(),
         })
@@ -125,8 +128,12 @@ fn protected_routes(state: AppState) -> Router<AppState> {
             "/v1/realtime/calls/{call_id}/",
             any(crate::live::sideband::handle_sideband),
         )
-        .route("/v1/realtime", any(crate::live::sideband::handle_sideband))
-        .route("/v1/realtime/", any(crate::live::sideband::handle_sideband));
+        .route("/v1/realtime", any(crate::realtime::websocket::handle))
+        .route("/v1/realtime/", any(crate::realtime::websocket::handle))
+        .route(
+            "/v1/realtime/translations",
+            any(crate::realtime::websocket::handle),
+        );
 
     // The probe exists ONLY under `cfg(test)`: it gives the layer something to
     // wrap before the relay routes exist, without shipping a real endpoint.
@@ -316,8 +323,52 @@ mod tests {
         })
         .unwrap();
         grouped.limits.request_bytes = 321;
+        grouped.limits.active_connections = 3;
         let grouped = AppState::new(grouped).unwrap();
         assert_eq!(grouped.config.limits.request_bytes, 321);
+        assert_eq!(grouped.active_connections.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn websocket_shape_errors_beat_malformed_query_decoding() {
+        for request in [
+            Request::builder()
+                .uri("/v1/realtime?model=%GG")
+                .header("host", "127.0.0.1:10110")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/realtime?model=%GG")
+                .header("host", "127.0.0.1:10110")
+                .header("upgrade", "websocket")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = router(test_state()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn official_websocket_trailing_slashes_are_not_registered() {
+        for path in [
+            "/v1/realtime/?model=gpt-realtime-2.1",
+            "/v1/realtime/translations/?model=gpt-realtime-translate",
+        ] {
+            let response = router(test_state())
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("host", "127.0.0.1:10110")
+                        .header("upgrade", "websocket")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+        }
     }
 
     #[tokio::test]

@@ -37,6 +37,9 @@ pub fn support(profile: &UpstreamProfile, selection: &ProtocolSelection)
 
 `Support` is `Native`, `Adapted`, or `Unsupported { code }`. Table tests cover
 every profile/capability pair and fail if a new capability lacks a row.
+This table centralizes and replaces the temporary inline profile gates added by
+`100` and `110` without changing their already-tested public/private behavior.
+It must not move route, URL, credential, or pump ownership out of those phases.
 
 ### NEW `src/realtime/chatgpt.rs`
 

@@ -7,3 +7,6 @@ pub mod contract;
 pub mod headers;
 pub mod http;
 pub mod path;
+pub mod query;
+pub mod subprotocol;
+pub mod websocket;

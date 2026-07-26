@@ -1,76 +1,103 @@
 # 050 — Observability and frame forensics
 
-Work-phase `wp6-observability`. Deliverable: tracing plus the opt-in, metadata-only frame log.
-
-## New files
-
-```text
-src/observability/mod.rs
-src/observability/frame_log.rs
-```
+Work-phase `wp3-standalone-websocket`. Deliverable: credential-safe tracing and
+an opt-in, strictly metadata-only frame log.
 
 ## Tracing
 
-`tracing_subscriber` with an env filter (`GPT_LIVE_LOG`, default `info`). Spans: `call_create` (method, path, upstream host, status, elapsed) and `sideband` (join style, upstream host, close code). **Never** logged by the tracing layer: authorization values, account ids, bearer tokens, SDP bodies, session JSON, frame payloads, close reasons, or full upstream URLs (the host only, since a URL embeds the call id).
+`GPT_LIVE_LOG` configures the user `EnvFilter` and defaults to `info`. The
+formatting layer ANDs that filter with a non-overridable privacy filter that
+rejects every dependency target beginning with:
 
-The opt-in frame log is the one exception and is governed by its own guarantee below: it writes nothing for a clean frame and a bounded excerpt for a corrupted one.
+```text
+tungstenite
+tokio_tungstenite
+```
 
-Credential protection is layered, because a newtype alone is insufficient (`002` D5):
+Tungstenite can trace the complete serialized WebSocket client request, text
+messages, hexadecimal binary frames, and close reasons. Those records may
+contain `Authorization`, `openai-insecure-api-key.<ephemeral>`, transcripts, or
+peer-controlled secrets, and `HeaderValue::set_sensitive` cannot redact bytes
+after serialization. Consequently even explicit dependency directives cannot
+enable those targets:
 
-1. `BearerToken`'s `Debug` prints `Bearer <redacted>`, covering `{:?}` on `Config`.
-2. That protection **ends** the moment the token becomes a `HeaderValue` inside a `HeaderMap`, so every credential-bearing value is built with `HeaderValue::set_sensitive(true)`, and logging a whole `HeaderMap` is prohibited.
-3. `redacted_headers(&HeaderMap) -> String` is the only sanctioned renderer; it replaces the value of any sensitive header, plus a name list of `authorization`, `chatgpt-account-id`, `x-api-key`, `x-gpt-live-api-key`, and `x-oai-attestation`, with `<redacted>`. The attestation is client-supplied and copied into the upstream map, so it is treated as bearer-grade material rather than as an ordinary protocol header.
+```text
+GPT_LIVE_LOG=trace,tungstenite::handshake::client=trace
+```
 
-Tests assert all three: the `Debug` output, that a constructed auth header reports `is_sensitive()`, and that `redacted_headers` never echoes a token substring.
+Other tracing targets continue to obey the user filter. Tests emit canaries on
+the exact target and a child target while also proving an unrelated trace event
+survives.
 
-## Frame forensics
+Application spans record bounded operational metadata such as method, local
+path, upstream host, status, elapsed time, join style, and terminal outcome.
+They never record authorization values, account IDs, bearer tokens, SDP/session
+bodies, frame payloads, close reasons, full upstream URLs, call IDs, or browser
+protocol values.
+
+Credential protection remains layered:
+
+1. `BearerToken`'s `Debug` prints `Bearer <redacted>`.
+2. Credential-bearing `HeaderValue`s are marked sensitive.
+3. `redacted_headers` is the only sanctioned header renderer and also redacts
+   known credential channels by name.
+4. All Tungstenite and Tokio-Tungstenite dependency targets are hard-disabled
+   after the user filter is parsed.
+
+## Frame-forensics record
+
+The logger is inert unless `GPT_LIVE_FRAME_LOG` or its compatibility alias
+`OCX_LIVE_FRAME_LOG` supplies a non-empty path. Each text or binary application
+frame produces one JSONL record immediately before its send attempt:
 
 ```rust
-pub struct FrameLogger { path: Option<PathBuf> }
-
-#[derive(Serialize)]
-pub struct FrameRecord<'a> {
-    pub ts: String,          // RFC 3339
-    pub dir: &'static str,   // "c2u" | "u2c"
-    pub kind: &'static str,  // "text" | "binary"
-    pub bytes: usize,
-    pub fffd: bool,
-    #[serde(skip_serializing_if = "Option::is_none")] pub context: Option<&'a str>,
-}
-
-impl FrameLogger {
-    pub fn from_env() -> Self;                       // GPT_LIVE_FRAME_LOG, alias OCX_LIVE_FRAME_LOG
-    pub fn log(&self, dir: Direction, msg: &Message);
+pub struct FrameRecord {
+    pub ts: String,                         // RFC 3339 UTC
+    pub dir: &'static str,                  // "c2u" | "u2c"
+    pub kind: &'static str,                 // "text" | "binary"
+    pub bytes: usize,                       // wire payload bytes
+    pub fffd: bool,                         // U+FFFD or invalid UTF-8 found
+    pub fault_byte_offset: Option<usize>,   // first fault, omitted when clean
 }
 ```
 
-Rules carried over verbatim from `001` §8:
+`fault_byte_offset` is a zero-based byte offset, not a Unicode-scalar index. For
+text it marks the first literal U+FFFD. For binary it marks whichever appears
+first: a literal U+FFFD in the valid prefix or the first malformed UTF-8 byte.
+The field is diagnostic metadata only; it does not identify or retain adjacent
+content.
 
-- Unset env var → the logger is inert and does no work at all.
-- One JSONL record appended per relayed frame, immediately before the send attempt, so a record proves receipt and attempted forwarding rather than delivery.
-- `bytes` is the UTF-8 byte length for text and the raw length for binary.
-- Binary payloads are decoded **only** to detect U+FFFD; the decoded form never feeds back into the relayed frame.
-- `context` is present only when U+FFFD is found, spanning at most 24 scalars on each side of the first occurrence, clamped to char boundaries. A frame shorter than that window yields the whole frame; see the guarantee section below.
-- Any IO error while logging is swallowed — forensics must never break a call.
+The record never contains:
 
-`context` is computed over Unicode scalar values with char-boundary clamping. The TypeScript original slices UTF-16 code units with an exclusive end (up to 24 before, at most 23 after); the invariant preserved here is a *bounded* excerpt, not the exact unit count. `001` §8 records the divergence, and the guarantee section below states precisely what "bounded" does and does not promise.
+- text or binary payload bytes;
+- a payload excerpt or reversible digest;
+- authorization, protocol, model, call-ID, or account values;
+- WebSocket close reasons.
 
-## The privacy guarantee, stated precisely
+This guarantee applies equally to clean and faulty frames. A credential directly
+adjacent to U+FFFD or an invalid binary byte is absent from the JSONL output.
+Tests pin both cases with distinct canaries and assert the removed `context`
+field cannot reappear.
 
-The claim is **bounded excerpt**, not **no payload**. Specifically:
+## Relay safety
 
-- A clean frame produces no excerpt at all. This is the common case and the one that matters for a normal call.
-- A corrupted frame produces up to `CONTEXT_CHARS` scalars on each side of the first replacement character. A frame shorter than that window yields the whole frame.
-- Therefore a secret adjacent to the corruption **is** in the excerpt.
+Records are handed to a dedicated writer thread through a bounded channel.
+`try_send` drops records when the queue is full, so diagnostics cannot stall a
+voice relay. Synchronous file open/write errors are swallowed. Shutdown waits
+for the writer only up to the configured drain budget; an upgraded relay clone
+or blocked filesystem cannot prevent process termination.
 
-That last point is a deliberate trade rather than an oversight: an excerpt that omitted the surrounding bytes could not attribute corruption, which is the only reason the log exists. The mitigations are that the log is opt-in, that clean frames write nothing, and that the operator is told to treat the file as sensitive.
-
-Because the operator chooses the path, `.gitignore` cannot guarantee exclusion — the README instructs writing the log outside the working tree.
-
-## Non-blocking by construction
-
-Records are handed to a dedicated writer thread through a bounded channel and dropped when it is full. A synchronous `open`/`write` inside the relay would block on a slow disk, a stalled network filesystem, or a FIFO, and blocking there stops frame forwarding. Losing a diagnostic record under pressure is strictly better than stalling a voice call.
+Ping, pong, and close control frames are not frame-forensics records. `bytes`
+is the UTF-8 byte length for text and the untouched raw length for binary. The
+inspection result never feeds back into the relayed frame.
 
 ## Exit criteria
 
-Tests: inert when unset; a clean text frame produces `fffd: false` and no `context`; a frame containing U+FFFD produces a bounded excerpt, and text beyond the window is absent while adjacent text is captured by design; a multi-byte payload clamps to char boundaries; a binary frame reports raw byte length; an unwritable path does not panic or abort the relay; an append failure mid-relay leaves the relay running; `BearerToken` redaction, header sensitivity, and `redacted_headers`.
+- A hostile EnvFilter cannot enable Tungstenite/Tokio-Tungstenite handshake,
+  protocol, frame, or close targets, while unrelated tracing remains enabled.
+- A clean frame has `fffd: false` and omits `fault_byte_offset`.
+- Text and binary faults report the exact first byte offset.
+- Adjacent U+FFFD and binary credential canaries never appear in output.
+- No serialized record has `context`, payload, close-reason, or digest fields.
+- An unwritable path and a saturated writer cannot interrupt relay traffic.
+- Bearer `Debug`, header sensitivity, and `redacted_headers` remain covered.

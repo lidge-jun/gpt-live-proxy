@@ -180,6 +180,12 @@ Disabled entirely when the env var is unset. When set to a path, every relayed f
 
 A clean frame writes no payload, headers and URLs never appear, and a logging exception can never break the relay. The excerpt around a replacement character does contain adjacent transcript text and is therefore sensitive diagnostic data (`src/server/live.ts:73-80`).
 
+The current Rust service deliberately hardens beyond that source behavior: its
+record keeps only the fault flag and first fault byte offset and never stores
+`context` or payload bytes. `docs/050_observability.md` is authoritative for the
+Rust runtime; the excerpt above remains research evidence for the TypeScript
+source only.
+
 ## 9. Test-derived contract inventory
 
 `tests/server-live.test.ts` pins: multipart → backend JSON with the AVAS URL; keyed multipart preservation; the protocol-header whitelist and its omission behavior; `/v1/realtime/calls` as an alias; SDP-only bodies; the voice preflight header list; the missing-upstream `400`; the non-upgrade `GET /v1/live` `404`; pool credentials overriding caller bearer/account; sideband upgrade URL, headers and bidirectional echo; parser mappings; UTF-8/binary/large-frame transparency; metadata-only forensics (`tests/server-live.test.ts:140-419`, `:421-604`, `:606-815`).

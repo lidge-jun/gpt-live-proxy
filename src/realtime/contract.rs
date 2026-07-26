@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::config::UpstreamCredentialMode;
 
-use super::path::{parse_rest_path, PathError, RestOperation};
+use super::path::{parse_rest_path, validate_call_id, PathError, RestOperation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiDialect {
@@ -59,6 +59,37 @@ pub struct RouteFacts<'a> {
 pub struct ClassifiedRest {
     pub operation: RestOperation,
     pub selection: ProtocolSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSocketTarget {
+    Standalone { model: String },
+    ExistingCall { call_id: String },
+    Translation { model: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedWebSocket {
+    pub target: WebSocketTarget,
+    pub selection: ProtocolSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WebSocketContractError {
+    #[error("unknown Realtime WebSocket route")]
+    UnknownRoute,
+    #[error("method is not allowed for this Realtime WebSocket route")]
+    MethodNotAllowed,
+    #[error("Realtime WebSocket query is missing its selector")]
+    MissingSelector,
+    #[error("Realtime WebSocket query has conflicting or duplicate selectors")]
+    AmbiguousQuery,
+    #[error("invalid Realtime call_id")]
+    InvalidCallId,
+    #[error("private Realtime dialect requires managed credentials")]
+    PrivateDialectRequiresManaged,
+    #[error("private Realtime dialect is not supported on this WebSocket route")]
+    PrivateDialectNotSupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -119,12 +150,27 @@ impl From<RestContractError> for ContractError {
     }
 }
 
-pub fn classify(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, ContractError> {
-    if facts.path == "/v1/realtime" {
-        return classify_websocket(facts);
+impl From<WebSocketContractError> for ContractError {
+    fn from(error: WebSocketContractError) -> Self {
+        match error {
+            WebSocketContractError::UnknownRoute => Self::UnknownRoute,
+            WebSocketContractError::MethodNotAllowed => Self::MethodNotAllowed,
+            WebSocketContractError::MissingSelector => Self::MissingSelector,
+            WebSocketContractError::AmbiguousQuery => Self::AmbiguousQuery,
+            WebSocketContractError::InvalidCallId => Self::InvalidCallId,
+            WebSocketContractError::PrivateDialectRequiresManaged => {
+                Self::PrivateDialectRequiresManaged
+            }
+            WebSocketContractError::PrivateDialectNotSupported => Self::PrivateDialectNotSupported,
+        }
     }
-    if facts.path == "/v1/realtime/translations" {
-        return classify_translation_websocket(facts);
+}
+
+pub fn classify(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, ContractError> {
+    if matches!(facts.path, "/v1/realtime" | "/v1/realtime/translations") {
+        return classify_websocket(facts)
+            .map(|classified| classified.selection)
+            .map_err(ContractError::from);
     }
     classify_rest(facts)
         .map(|classified| classified.selection)
@@ -225,65 +271,83 @@ fn classify_official_rest(
     })
 }
 
-fn classify_websocket(facts: &RouteFacts<'_>) -> Result<ProtocolSelection, ContractError> {
-    if facts.method != Method::GET {
-        return Err(ContractError::MethodNotAllowed);
-    }
-    let transport = selector_transport(facts.query)?;
-    let dialect = private_dialect(facts.openai_alpha).unwrap_or(ApiDialect::OfficialGa);
-    if dialect != ApiDialect::OfficialGa {
-        require_managed(facts.credential_mode)?;
-    }
-
-    Ok(ProtocolSelection {
-        dialect,
-        transport,
-        session_kind: if transport == Transport::StandaloneWebSocket {
-            SessionKind::Realtime
-        } else {
-            SessionKind::Opaque
-        },
-        credential: if dialect == ApiDialect::OfficialGa {
-            configured_credential(facts.credential_mode)
-        } else {
-            CredentialPolicy::Managed
-        },
-    })
-}
-
-fn classify_translation_websocket(
+pub fn classify_websocket(
     facts: &RouteFacts<'_>,
-) -> Result<ProtocolSelection, ContractError> {
+) -> Result<ClassifiedWebSocket, WebSocketContractError> {
+    if !matches!(facts.path, "/v1/realtime" | "/v1/realtime/translations") {
+        return Err(WebSocketContractError::UnknownRoute);
+    }
     if facts.method != Method::GET {
-        return Err(ContractError::MethodNotAllowed);
+        return Err(WebSocketContractError::MethodNotAllowed);
     }
-    if private_dialect(facts.openai_alpha).is_some() {
-        return Err(ContractError::PrivateDialectNotSupported);
-    }
-
     let models = selector_values(facts.query, "model");
     let call_ids = selector_values(facts.query, "call_id");
-    match (models.as_slice(), call_ids.as_slice()) {
-        ([model], []) if !model.trim().is_empty() => Ok(ProtocolSelection {
-            dialect: ApiDialect::OfficialGa,
-            transport: Transport::TranslationWebSocket,
-            session_kind: SessionKind::Translation,
-            credential: configured_credential(facts.credential_mode),
-        }),
-        ([], []) | ([_], []) => Err(ContractError::MissingSelector),
-        _ => Err(ContractError::AmbiguousQuery),
-    }
-}
 
-fn selector_transport(query: &[(String, String)]) -> Result<Transport, ContractError> {
-    let models = selector_values(query, "model");
-    let call_ids = selector_values(query, "call_id");
-    match (models.as_slice(), call_ids.as_slice()) {
-        ([model], []) if !model.trim().is_empty() => Ok(Transport::StandaloneWebSocket),
-        ([], [call_id]) if !call_id.trim().is_empty() => Ok(Transport::ExistingCallWebSocket),
-        ([], []) | ([_], []) | ([], [_]) => Err(ContractError::MissingSelector),
-        _ => Err(ContractError::AmbiguousQuery),
-    }
+    let (target, transport, session_kind, dialect) = if facts.path == "/v1/realtime/translations" {
+        if private_dialect(facts.openai_alpha).is_some() {
+            return Err(WebSocketContractError::PrivateDialectNotSupported);
+        }
+        if !call_ids.is_empty() {
+            return Err(WebSocketContractError::AmbiguousQuery);
+        }
+        let model = match models.as_slice() {
+            [model] if !model.trim().is_empty() => (*model).to_string(),
+            [] | [_] => return Err(WebSocketContractError::MissingSelector),
+            _ => return Err(WebSocketContractError::AmbiguousQuery),
+        };
+        (
+            WebSocketTarget::Translation { model },
+            Transport::TranslationWebSocket,
+            SessionKind::Translation,
+            ApiDialect::OfficialGa,
+        )
+    } else {
+        if call_ids.len() > 1 {
+            return Err(WebSocketContractError::AmbiguousQuery);
+        }
+        let (target, transport, session_kind) = if let [call_id] = call_ids.as_slice() {
+            validate_call_id(call_id).map_err(|_| WebSocketContractError::InvalidCallId)?;
+            (
+                WebSocketTarget::ExistingCall {
+                    call_id: (*call_id).to_string(),
+                },
+                Transport::ExistingCallWebSocket,
+                SessionKind::Opaque,
+            )
+        } else {
+            let model = match models.as_slice() {
+                [model] if !model.trim().is_empty() => (*model).to_string(),
+                [] | [_] => return Err(WebSocketContractError::MissingSelector),
+                _ => return Err(WebSocketContractError::AmbiguousQuery),
+            };
+            (
+                WebSocketTarget::Standalone { model },
+                Transport::StandaloneWebSocket,
+                SessionKind::Realtime,
+            )
+        };
+        let dialect = private_dialect(facts.openai_alpha).unwrap_or(ApiDialect::OfficialGa);
+        if dialect != ApiDialect::OfficialGa
+            && facts.credential_mode == UpstreamCredentialMode::Client
+        {
+            return Err(WebSocketContractError::PrivateDialectRequiresManaged);
+        }
+        (target, transport, session_kind, dialect)
+    };
+
+    Ok(ClassifiedWebSocket {
+        target,
+        selection: ProtocolSelection {
+            dialect,
+            transport,
+            session_kind,
+            credential: if dialect == ApiDialect::OfficialGa {
+                configured_credential(facts.credential_mode)
+            } else {
+                CredentialPolicy::Managed
+            },
+        },
+    })
 }
 
 fn selector_values<'a>(query: &'a [(String, String)], key: &str) -> Vec<&'a str> {
@@ -417,13 +481,6 @@ fn configured_credential(mode: UpstreamCredentialMode) -> CredentialPolicy {
     match mode {
         UpstreamCredentialMode::Managed => CredentialPolicy::Managed,
         UpstreamCredentialMode::Client => CredentialPolicy::ClientBearer,
-    }
-}
-
-fn require_managed(mode: UpstreamCredentialMode) -> Result<(), ContractError> {
-    match mode {
-        UpstreamCredentialMode::Managed => Ok(()),
-        UpstreamCredentialMode::Client => Err(ContractError::PrivateDialectRequiresManaged),
     }
 }
 
@@ -603,21 +660,21 @@ mod tests {
             ),
             (
                 vec![("call_id".into(), "".into())],
-                Err(ContractError::MissingSelector),
+                Err(ContractError::InvalidCallId),
             ),
             (
                 vec![
                     ("model".into(), "gpt-realtime-2.1".into()),
                     ("call_id".into(), "rtc_a".into()),
                 ],
-                Err(ContractError::AmbiguousQuery),
+                Ok(Transport::ExistingCallWebSocket),
             ),
             (
                 vec![
                     ("call_id".into(), "rtc_a".into()),
                     ("model".into(), "gpt-realtime-2.1".into()),
                 ],
-                Err(ContractError::AmbiguousQuery),
+                Ok(Transport::ExistingCallWebSocket),
             ),
             (
                 vec![("model".into(), "a".into()), ("model".into(), "b".into())],
@@ -629,6 +686,14 @@ mod tests {
                     ("call_id".into(), "rtc_b".into()),
                 ],
                 Err(ContractError::AmbiguousQuery),
+            ),
+            (
+                vec![
+                    ("model".into(), "a".into()),
+                    ("call_id".into(), "rtc_a".into()),
+                    ("model".into(), "b".into()),
+                ],
+                Ok(Transport::ExistingCallWebSocket),
             ),
         ];
 
@@ -702,6 +767,108 @@ mod tests {
             )),
             Err(ContractError::PrivateDialectRequiresManaged)
         );
+    }
+
+    #[test]
+    fn websocket_classifier_owns_target_and_validates_call_id_boundaries() {
+        let maximum = "a".repeat(super::super::path::MAX_CALL_ID_LEN);
+        let query = [
+            ("model".into(), "ignored-one".into()),
+            ("call_id".into(), maximum.clone()),
+            ("model".into(), "ignored-two".into()),
+        ];
+        let classified = classify_websocket(&facts(
+            &Method::GET,
+            "/v1/realtime",
+            &query,
+            None,
+            None,
+            UpstreamCredentialMode::Client,
+        ))
+        .unwrap();
+        assert_eq!(
+            classified.target,
+            WebSocketTarget::ExistingCall { call_id: maximum }
+        );
+        assert_eq!(
+            classified.selection,
+            selection(
+                ApiDialect::OfficialGa,
+                Transport::ExistingCallWebSocket,
+                SessionKind::Opaque,
+                CredentialPolicy::ClientBearer,
+            )
+        );
+
+        for invalid in [
+            "".to_string(),
+            "a".repeat(super::super::path::MAX_CALL_ID_LEN + 1),
+            "rtc/slash".to_string(),
+            "한글".to_string(),
+        ] {
+            let query = [("call_id".into(), invalid)];
+            assert_eq!(
+                classify_websocket(&facts(
+                    &Method::GET,
+                    "/v1/realtime",
+                    &query,
+                    None,
+                    None,
+                    UpstreamCredentialMode::Managed,
+                )),
+                Err(WebSocketContractError::InvalidCallId)
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_contract_errors_and_broad_mapping_are_exhaustive() {
+        let empty = [];
+        let unknown = facts(
+            &Method::GET,
+            "/v1/realtime/",
+            &empty,
+            None,
+            None,
+            UpstreamCredentialMode::Managed,
+        );
+        assert_eq!(
+            classify_websocket(&unknown),
+            Err(WebSocketContractError::UnknownRoute)
+        );
+        let rows = [
+            (
+                WebSocketContractError::UnknownRoute,
+                ContractError::UnknownRoute,
+            ),
+            (
+                WebSocketContractError::MethodNotAllowed,
+                ContractError::MethodNotAllowed,
+            ),
+            (
+                WebSocketContractError::MissingSelector,
+                ContractError::MissingSelector,
+            ),
+            (
+                WebSocketContractError::AmbiguousQuery,
+                ContractError::AmbiguousQuery,
+            ),
+            (
+                WebSocketContractError::InvalidCallId,
+                ContractError::InvalidCallId,
+            ),
+            (
+                WebSocketContractError::PrivateDialectRequiresManaged,
+                ContractError::PrivateDialectRequiresManaged,
+            ),
+            (
+                WebSocketContractError::PrivateDialectNotSupported,
+                ContractError::PrivateDialectNotSupported,
+            ),
+        ];
+        for (specific, broad) in rows {
+            assert_eq!(ContractError::from(specific), broad);
+        }
     }
 
     #[test]
